@@ -232,6 +232,78 @@ describe('TimelinePlugin', () => {
   })
 })
 
+// #3551: a top timeline used to be drawn over the top of the waveform, so high peaks ran under its
+// labels. It now reserves its own height above the waveform as padding on the scroll container.
+describe('TimelinePlugin top timeline (insertPosition: beforebegin)', () => {
+  // The real wrapper sits in a scroll container and holds the waveform's canvases div, which a
+  // 'beforebegin' timeline is inserted in front of.
+  const createWaveSurferInScrollContainer = () => {
+    const wavesurfer = createWaveSurfer(1, 100)
+    const wrapper = wavesurfer.getWrapper()
+    wrapper.appendChild(document.createElement('div'))
+    const scrollContainer = document.createElement('div')
+    document.body.appendChild(scrollContainer)
+    scrollContainer.appendChild(wrapper)
+    return { wavesurfer, scrollContainer }
+  }
+  const timelineIn = (wrapper: HTMLElement, index: number) =>
+    wrapper.querySelectorAll<HTMLElement>('[part="timeline"]')[index]
+
+  afterEach(() => {
+    document.body.innerHTML = ''
+    jest.clearAllMocks()
+  })
+
+  test('reserves its height above the waveform and sits in that space', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    const plugin = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    plugin._init(wavesurfer as any)
+
+    expect(scrollContainer.style.paddingTop).toBe('20px')
+    expect(timelineIn(wavesurfer.getWrapper(), 0).style.top).toBe('-20px')
+
+    plugin.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('')
+  })
+
+  test('stacks several top timelines above each other', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    const first = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    const second = TimelinePlugin.create({ duration: 1, height: 10, insertPosition: 'beforebegin' })
+    first._init(wavesurfer as any)
+    second._init(wavesurfer as any)
+
+    expect(scrollContainer.style.paddingTop).toBe('30px')
+    const tops = Array.from(
+      wavesurfer.getWrapper().querySelectorAll<HTMLElement>('[part="timeline"]'),
+      (t) => t.style.top,
+    )
+    expect(tops.sort()).toEqual(['-20px', '-30px'])
+
+    second.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('20px')
+    first.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('')
+  })
+
+  test('leaves the scroll container alone for a bottom timeline', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    TimelinePlugin.create({ duration: 1 })._init(wavesurfer as any)
+    expect(scrollContainer.style.paddingTop).toBe('')
+  })
+
+  test('reserves no space when the top timeline is in its own container', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    const container = document.createElement('div')
+    container.appendChild(document.createElement('div'))
+    document.body.appendChild(container)
+    TimelinePlugin.create({ duration: 1, container, insertPosition: 'beforebegin' })._init(wavesurfer as any)
+
+    expect(scrollContainer.style.paddingTop).toBe('')
+    expect(timelineIn(container, 0).style.top).toBe('0px')
+  })
+})
+
 describe('TimelinePlugin duration option without audio', () => {
   afterEach(() => {
     document.body.innerHTML = ''

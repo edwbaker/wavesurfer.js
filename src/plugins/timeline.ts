@@ -13,7 +13,7 @@ export type TimelinePluginOptions = {
   height?: number
   /** HTML element or selector for a timeline container, defaults to wavesufer's container */
   container?: HTMLElement | string
-  /** Pass 'beforebegin' to insert the timeline on top of the waveform */
+  /** Pass 'beforebegin' to insert the timeline on top of the waveform, which adds its height above the waveform */
   insertPosition?: InsertPosition
   /** The duration of the timeline in seconds, defaults to wavesurfer's duration */
   duration?: number
@@ -63,6 +63,9 @@ const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents,
     const opts: TimelinePluginOptions & typeof defaultOptions = Object.assign({}, defaultOptions, options)
 
     const timelineWrapper = createElement('div', { part: 'timeline-wrapper', style: { pointerEvents: 'none' } })
+    // How far above the waveform a top timeline sits: the space it reserved plus any reserved by
+    // top timelines registered before it. Set once the container is resolved, below.
+    let reservedTop = 0
 
     // Notch metadata for batch visibility updates, and the currently rendered
     // timeline element (rebuilt on every initTimeline() call).
@@ -170,7 +173,7 @@ const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents,
           ...(isTop
             ? {
                 position: 'absolute',
-                top: '0',
+                top: `${-reservedTop}px`,
                 left: '0',
                 right: '0',
                 zIndex: '2',
@@ -247,6 +250,22 @@ const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents,
       container.appendChild(timelineWrapper)
     }
     ctx.scope.add(() => timelineWrapper.remove())
+
+    // A top timeline inside the waveform gets its own space above it, like a bottom one does,
+    // instead of being drawn over the waveform's top edge where high peaks run under the labels
+    // (#3551). The space is padding on the scroll container, so the waveform, progress and cursor
+    // move down together; the timeline sits in it at a negative top and still scrolls with them.
+    // Each top timeline stacks above the ones registered before it.
+    const scrollContainer = ctx.wavesurfer.getWrapper().parentElement
+    if (opts.insertPosition === 'beforebegin' && container === ctx.wavesurfer.getWrapper() && scrollContainer) {
+      reservedTop = (parseFloat(scrollContainer.style.paddingTop) || 0) + opts.height
+      scrollContainer.style.paddingTop = `${reservedTop}px`
+      ctx.scope.add(() => {
+        const remaining = (parseFloat(scrollContainer.style.paddingTop) || 0) - opts.height
+        if (remaining > 0) scrollContainer.style.paddingTop = `${remaining}px`
+        else scrollContainer.style.removeProperty('padding-top')
+      })
+    }
 
     // Get reactive state
     const { duration } = ctx.state
