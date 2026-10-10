@@ -57,14 +57,62 @@ export type TimelinePluginEvents = BasePluginEvents & {
   ready: []
 }
 
+// Top timelines sharing one scroll container reserve space above the waveform together. The stack
+// remembers the container's own padding (a stylesheet may set it, e.g. through ::part(scroll)) and
+// its inline declaration, so that spacing is kept while any timeline is active and the original
+// declaration is put back when the last one goes. Every add or remove re-lays out all the entries,
+// so destroying timelines in any order keeps the remaining ones sitting right above the waveform.
+type TopReservation = { height: number; place: (offset: number) => void }
+type TopStack = { basePadding: number; inlineValue: string; inlinePriority: string; entries: TopReservation[] }
+const topStacks = new WeakMap<HTMLElement, TopStack>()
+
+function layoutTopStack(scrollContainer: HTMLElement, stack: TopStack) {
+  let offset = 0
+  for (const entry of stack.entries) {
+    offset += entry.height
+    entry.place(offset)
+  }
+  scrollContainer.style.setProperty('padding-top', `${stack.basePadding + offset}px`)
+}
+
+/** Reserves `height` px above the waveform, returns a function that gives it back. */
+function reserveTopSpace(scrollContainer: HTMLElement, height: number, place: (offset: number) => void) {
+  let stack = topStacks.get(scrollContainer)
+  if (!stack) {
+    stack = {
+      basePadding: parseFloat(getComputedStyle(scrollContainer).paddingTop) || 0,
+      inlineValue: scrollContainer.style.getPropertyValue('padding-top'),
+      inlinePriority: scrollContainer.style.getPropertyPriority('padding-top'),
+      entries: [],
+    }
+    topStacks.set(scrollContainer, stack)
+  }
+  const entry: TopReservation = { height, place }
+  stack.entries.push(entry)
+  layoutTopStack(scrollContainer, stack)
+
+  return () => {
+    const index = stack.entries.indexOf(entry)
+    if (index === -1) return
+    stack.entries.splice(index, 1)
+    if (stack.entries.length) {
+      layoutTopStack(scrollContainer, stack)
+      return
+    }
+    topStacks.delete(scrollContainer)
+    if (stack.inlineValue) scrollContainer.style.setProperty('padding-top', stack.inlineValue, stack.inlinePriority)
+    else scrollContainer.style.removeProperty('padding-top')
+  }
+}
+
 const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents, object>(
   'TimelinePlugin',
   (ctx, options) => {
     const opts: TimelinePluginOptions & typeof defaultOptions = Object.assign({}, defaultOptions, options)
 
     const timelineWrapper = createElement('div', { part: 'timeline-wrapper', style: { pointerEvents: 'none' } })
-    // How far above the waveform a top timeline sits: the space it reserved plus any reserved by
-    // top timelines registered before it. Set once the container is resolved, below.
+    // How far above the waveform a top timeline sits (px): its own height plus that of the top
+    // timelines registered before it. Kept up to date by reserveTopSpace().
     let reservedTop = 0
 
     // Notch metadata for batch visibility updates, and the currently rendered
@@ -258,13 +306,12 @@ const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents,
     // Each top timeline stacks above the ones registered before it.
     const scrollContainer = ctx.wavesurfer.getWrapper().parentElement
     if (opts.insertPosition === 'beforebegin' && container === ctx.wavesurfer.getWrapper() && scrollContainer) {
-      reservedTop = (parseFloat(scrollContainer.style.paddingTop) || 0) + opts.height
-      scrollContainer.style.paddingTop = `${reservedTop}px`
-      ctx.scope.add(() => {
-        const remaining = (parseFloat(scrollContainer.style.paddingTop) || 0) - opts.height
-        if (remaining > 0) scrollContainer.style.paddingTop = `${remaining}px`
-        else scrollContainer.style.removeProperty('padding-top')
-      })
+      ctx.scope.add(
+        reserveTopSpace(scrollContainer, opts.height, (offset) => {
+          reservedTop = offset
+          if (currentTimeline) currentTimeline.style.top = `${-offset}px`
+        }),
+      )
     }
 
     // Get reactive state

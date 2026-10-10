@@ -286,6 +286,61 @@ describe('TimelinePlugin top timeline (insertPosition: beforebegin)', () => {
     expect(scrollContainer.style.paddingTop).toBe('')
   })
 
+  test('keeps the remaining timelines above the waveform when they are destroyed in any order', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    const first = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    const second = TimelinePlugin.create({ duration: 1, height: 10, insertPosition: 'beforebegin' })
+    first._init(wavesurfer as any)
+    second._init(wavesurfer as any)
+    // DOM order isn't registration order, so find each timeline by its height
+    const timelines = Array.from(wavesurfer.getWrapper().querySelectorAll<HTMLElement>('[part="timeline"]'))
+    const firstEl = timelines.find((el) => el.style.height === '20px') as HTMLElement
+    const secondEl = timelines.find((el) => el.style.height === '10px') as HTMLElement
+    expect(firstEl.style.top).toBe('-20px')
+    expect(secondEl.style.top).toBe('-30px')
+
+    // The one registered first goes first: the survivor must close up against the waveform
+    // instead of staying at its old, now out-of-padding, offset.
+    first.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('10px')
+    expect(secondEl.style.top).toBe('-10px')
+
+    second.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('')
+  })
+
+  test('keeps stylesheet padding on the scroll container while a top timeline is active', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    // e.g. a page styling the public ::part(scroll) surface; no inline declaration at all
+    const style = document.createElement('style')
+    style.textContent = '.styled { padding-top: 8px }'
+    document.head.appendChild(style)
+    scrollContainer.className = 'styled'
+
+    const plugin = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    plugin._init(wavesurfer as any)
+    expect(scrollContainer.style.paddingTop).toBe('28px')
+    // The timeline sits against the waveform, below the page's own 8px
+    expect(wavesurfer.getWrapper().querySelector<HTMLElement>('[part="timeline"]')?.style.top).toBe('-20px')
+
+    plugin.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('')
+    style.remove()
+  })
+
+  test('restores the original inline padding when the last top timeline is destroyed', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    scrollContainer.style.setProperty('padding-top', '6px', 'important')
+
+    const plugin = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    plugin._init(wavesurfer as any)
+    expect(scrollContainer.style.paddingTop).toBe('26px')
+
+    plugin.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('6px')
+    expect(scrollContainer.style.getPropertyPriority('padding-top')).toBe('important')
+  })
+
   test('leaves the scroll container alone for a bottom timeline', () => {
     const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
     TimelinePlugin.create({ duration: 1 })._init(wavesurfer as any)
