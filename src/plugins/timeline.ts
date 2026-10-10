@@ -66,6 +66,18 @@ type TopReservation = { height: number; place: (offset: number) => void }
 type TopStack = { basePadding: number; inlineValue: string; inlinePriority: string; entries: TopReservation[] }
 const topStacks = new WeakMap<HTMLElement, TopStack>()
 
+function restoreInlinePadding(scrollContainer: HTMLElement, stack: TopStack) {
+  if (stack.inlineValue) scrollContainer.style.setProperty('padding-top', stack.inlineValue, stack.inlinePriority)
+  else scrollContainer.style.removeProperty('padding-top')
+}
+
+// The page's own padding, as it is right now. Our reservation hides it (it is important), so put the
+// original inline declaration back first; the caller lays the stack out again straight afterwards.
+function measureBasePadding(scrollContainer: HTMLElement, stack: TopStack): number {
+  restoreInlinePadding(scrollContainer, stack)
+  return parseFloat(getComputedStyle(scrollContainer).paddingTop) || 0
+}
+
 function layoutTopStack(scrollContainer: HTMLElement, stack: TopStack) {
   let offset = 0
   for (const entry of stack.entries) {
@@ -78,7 +90,11 @@ function layoutTopStack(scrollContainer: HTMLElement, stack: TopStack) {
   scrollContainer.style.setProperty('padding-top', `${stack.basePadding + offset}px`, 'important')
 }
 
-/** Reserves `height` px above the waveform, returns a function that gives it back. */
+/**
+ * Reserves `height` px above the waveform. Returns a function that gives it back and one that
+ * re-reads the page's padding (it can change with the viewport, e.g. in a media query) and re-lays
+ * out, since the reservation freezes whatever padding was there when it was made.
+ */
 function reserveTopSpace(scrollContainer: HTMLElement, height: number, place: (offset: number) => void) {
   let stack = topStacks.get(scrollContainer)
   if (!stack) {
@@ -94,7 +110,7 @@ function reserveTopSpace(scrollContainer: HTMLElement, height: number, place: (o
   stack.entries.push(entry)
   layoutTopStack(scrollContainer, stack)
 
-  return () => {
+  const release = () => {
     const index = stack.entries.indexOf(entry)
     if (index === -1) return
     stack.entries.splice(index, 1)
@@ -103,9 +119,18 @@ function reserveTopSpace(scrollContainer: HTMLElement, height: number, place: (o
       return
     }
     topStacks.delete(scrollContainer)
-    if (stack.inlineValue) scrollContainer.style.setProperty('padding-top', stack.inlineValue, stack.inlinePriority)
-    else scrollContainer.style.removeProperty('padding-top')
+    restoreInlinePadding(scrollContainer, stack)
   }
+
+  const refresh = () => {
+    if (!stack.entries.includes(entry)) return
+    const base = measureBasePadding(scrollContainer, stack)
+    // Re-lay out either way: measuring put the original inline declaration back
+    stack.basePadding = base
+    layoutTopStack(scrollContainer, stack)
+  }
+
+  return { release, refresh }
 }
 
 const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents, object>(
@@ -309,12 +334,15 @@ const TimelinePlugin = definePlugin<TimelinePluginOptions, TimelinePluginEvents,
     // Each top timeline stacks above the ones registered before it.
     const scrollContainer = ctx.wavesurfer.getWrapper().parentElement
     if (opts.insertPosition === 'beforebegin' && container === ctx.wavesurfer.getWrapper() && scrollContainer) {
-      ctx.scope.add(
-        reserveTopSpace(scrollContainer, opts.height, (offset) => {
-          reservedTop = offset
-          if (currentTimeline) currentTimeline.style.top = `${-offset}px`
-        }),
-      )
+      const { release, refresh } = reserveTopSpace(scrollContainer, opts.height, (offset) => {
+        reservedTop = offset
+        if (currentTimeline) currentTimeline.style.top = `${-offset}px`
+      })
+      ctx.scope.add(release)
+      // The page's own padding can change with the viewport (a media query), but the reservation
+      // overrides it, so re-read it when the waveform re-renders or the window is resized.
+      ctx.scope.add(ctx.wavesurfer.on('redraw', refresh))
+      ctx.scope.listen(window, 'resize', refresh)
     }
 
     // Get reactive state

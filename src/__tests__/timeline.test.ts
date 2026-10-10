@@ -331,6 +331,48 @@ describe('TimelinePlugin top timeline (insertPosition: beforebegin)', () => {
     style.remove()
   })
 
+  test('follows the page padding when it changes after init (e.g. a media query), on resize and on redraw', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    const style = document.createElement('style')
+    style.textContent = '.styled { padding-top: 8px }'
+    document.head.appendChild(style)
+    scrollContainer.className = 'styled'
+
+    const plugin = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    plugin._init(wavesurfer as any)
+    expect(scrollContainer.style.paddingTop).toBe('28px')
+
+    // The page's padding changes; our own important value hides it until the next re-measure
+    style.textContent = '.styled { padding-top: 14px }'
+    expect(scrollContainer.style.paddingTop).toBe('28px')
+    window.dispatchEvent(new Event('resize'))
+    expect(scrollContainer.style.paddingTop).toBe('34px')
+
+    style.textContent = '.styled { padding-top: 2px }'
+    wavesurfer.emit('redraw')
+    expect(scrollContainer.style.paddingTop).toBe('22px')
+
+    // Still gives everything back at the end
+    plugin.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('')
+    style.remove()
+  })
+
+  test('re-measuring keeps the original inline padding as the base', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    scrollContainer.style.paddingTop = '6px'
+
+    const plugin = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
+    plugin._init(wavesurfer as any)
+    expect(scrollContainer.style.paddingTop).toBe('26px')
+
+    window.dispatchEvent(new Event('resize'))
+    expect(scrollContainer.style.paddingTop).toBe('26px')
+
+    plugin.destroy()
+    expect(scrollContainer.style.paddingTop).toBe('6px')
+  })
+
   test('restores the original inline padding when the last top timeline is destroyed', () => {
     const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
     scrollContainer.style.setProperty('padding-top', '6px', 'important')
