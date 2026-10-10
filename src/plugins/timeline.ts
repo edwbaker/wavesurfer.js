@@ -72,7 +72,10 @@ function layoutTopStack(scrollContainer: HTMLElement, stack: TopStack) {
     offset += entry.height
     entry.place(offset)
   }
-  scrollContainer.style.setProperty('padding-top', `${stack.basePadding + offset}px`)
+  // `important`: a page rule on the container (e.g. `::part(scroll) { padding-top }`) comes from an
+  // outer tree context and beats a normal inline declaration, which would leave the timeline
+  // clipped above the container. Its value is already part of basePadding, so it isn't lost.
+  scrollContainer.style.setProperty('padding-top', `${stack.basePadding + offset}px`, 'important')
 }
 
 /** Reserves `height` px above the waveform, returns a function that gives it back. */

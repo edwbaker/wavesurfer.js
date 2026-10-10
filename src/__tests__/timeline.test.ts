@@ -320,6 +320,9 @@ describe('TimelinePlugin top timeline (insertPosition: beforebegin)', () => {
     const plugin = TimelinePlugin.create({ duration: 1, height: 20, insertPosition: 'beforebegin' })
     plugin._init(wavesurfer as any)
     expect(scrollContainer.style.paddingTop).toBe('28px')
+    // Important, or the page's own ::part(scroll) rule (an outer tree context) would beat this
+    // inline value in a real browser and leave the timeline clipped above the container.
+    expect(scrollContainer.style.getPropertyPriority('padding-top')).toBe('important')
     // The timeline sits against the waveform, below the page's own 8px
     expect(wavesurfer.getWrapper().querySelector<HTMLElement>('[part="timeline"]')?.style.top).toBe('-20px')
 
