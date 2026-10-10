@@ -13,7 +13,11 @@ export type TimelinePluginOptions = {
   height?: number
   /** HTML element or selector for a timeline container, defaults to wavesufer's container */
   container?: HTMLElement | string
-  /** Pass 'beforebegin' to insert the timeline on top of the waveform, which adds its height above the waveform */
+  /**
+   * Pass 'beforebegin' to insert the timeline on top of the waveform. In the default container it gets its own
+   * space above the waveform (the player grows by `height`). With a custom `container` no space is reserved and
+   * the timeline is positioned at the top of that container.
+   */
   insertPosition?: InsertPosition
   /** The duration of the timeline in seconds, defaults to wavesurfer's duration */
   duration?: number
@@ -123,7 +127,9 @@ function reserveTopSpace(scrollContainer: HTMLElement, height: number, place: (o
   }
 
   const refresh = () => {
-    if (!stack.entries.includes(entry)) return
+    // Every top timeline registers this for the same events but they share one stack, so only the
+    // first live entry does the work. When it is released the next one becomes the first, and takes over.
+    if (stack.entries[0] !== entry) return
     const base = measureBasePadding(scrollContainer, stack)
     // Re-lay out either way: measuring put the original inline declaration back
     stack.basePadding = base

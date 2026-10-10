@@ -358,6 +358,38 @@ describe('TimelinePlugin top timeline (insertPosition: beforebegin)', () => {
     style.remove()
   })
 
+  test('re-measures the shared stack once per event, and the next timeline takes over when the first is destroyed', () => {
+    const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
+    const style = document.createElement('style')
+    style.textContent = '.styled { padding-top: 8px }'
+    document.head.appendChild(style)
+    scrollContainer.className = 'styled'
+
+    const plugins = [20, 10, 10].map((height) =>
+      TimelinePlugin.create({ duration: 1, height, insertPosition: 'beforebegin' }),
+    )
+    plugins.forEach((plugin) => plugin._init(wavesurfer as any))
+    expect(scrollContainer.style.paddingTop).toBe('48px')
+
+    // Each timeline listens for resize, but they share one stack: one event, one measurement
+    const computedStyle = jest.spyOn(window, 'getComputedStyle')
+    window.dispatchEvent(new Event('resize'))
+    expect(computedStyle).toHaveBeenCalledTimes(1)
+
+    // The first one goes away: the next becomes responsible, so the page's padding is still followed
+    plugins[0].destroy()
+    style.textContent = '.styled { padding-top: 14px }'
+    computedStyle.mockClear()
+    window.dispatchEvent(new Event('resize'))
+    expect(computedStyle).toHaveBeenCalledTimes(1)
+    expect(scrollContainer.style.paddingTop).toBe('34px')
+
+    computedStyle.mockRestore()
+    plugins.slice(1).forEach((plugin) => plugin.destroy())
+    expect(scrollContainer.style.paddingTop).toBe('')
+    style.remove()
+  })
+
   test('re-measuring keeps the original inline padding as the base', () => {
     const { wavesurfer, scrollContainer } = createWaveSurferInScrollContainer()
     scrollContainer.style.paddingTop = '6px'
