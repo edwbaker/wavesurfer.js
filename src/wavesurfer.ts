@@ -87,8 +87,8 @@ export type WaveSurferOptions = {
    * under 1% more memory than the audio. With it on, `normalize` also reads its peak from the summary, at any
    * zoom.
    *
-   * A peak is drawn within a quarter of a column of where drawing the samples puts it, and where the runs line up
-   * with the columns nothing differs. The summary is of the audio as it was when it was made: a change to the
+   * A peak is drawn within half a column of where drawing the samples puts it, and where the runs line up with
+   * the columns nothing differs. The summary is of the audio as it was when it was made: a change to the
    * samples in place is drawn only after loading the audio again. A custom `renderFunction` is always given the
    * samples. Off by default.
    */

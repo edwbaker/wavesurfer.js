@@ -5,10 +5,13 @@
  * the place of the samples. A fit to the width of an hour of audio then reads thousands of values, not millions.
  *
  * A level is a `Float32Array` that can be drawn as if it were the channel. A value stands for the whole run of
- * samples it summarises, at the position of the first of them, so a peak can be drawn up to one bucket from where
- * its sample is, and a level is only used for a column that holds at least `BUCKETS_PER_COLUMN` of its buckets:
- * a peak is then drawn within a quarter of a column of where drawing the samples puts it. Where the edges of the
- * buckets are the edges of the columns, nothing differs.
+ * samples it summarises and is drawn at the position of the first of them, so a peak can be drawn up to one
+ * bucket before where its sample is. The last run is short unless the audio is a whole number of buckets, but is
+ * drawn as a whole bucket, which stretches the level over its width and moves the buckets before it by up to one
+ * more bucket, in the same direction. A level is only used for a column that holds at least `BUCKETS_PER_COLUMN`
+ * of its buckets, so a peak is drawn within two buckets, which is `2 / BUCKETS_PER_COLUMN` of a column (half a
+ * column), of where drawing the samples puts it. Where the edges of the buckets are the edges of the columns and
+ * the audio is a whole number of buckets, nothing differs.
  */
 
 /** The number of samples summarised by one value of the finest level. */
@@ -16,7 +19,8 @@ export const FINEST_BUCKET = 256
 
 /**
  * How many buckets of a level a column must hold for the level to be drawn in the place of the samples. A bucket
- * is drawn whole in one column, so the more of them a column holds, the closer to the sample a peak is drawn.
+ * is drawn whole in one column, so the more of them a column holds, the closer to the sample a peak is drawn: at
+ * most `2 / BUCKETS_PER_COLUMN` of a column away.
  */
 export const BUCKETS_PER_COLUMN = 4
 

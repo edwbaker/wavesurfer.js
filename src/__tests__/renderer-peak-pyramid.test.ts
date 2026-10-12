@@ -1,8 +1,8 @@
 /**
  * With `peakPyramid` on, a waveform zoomed out far enough is drawn from a summary of the audio (the largest
  * sample in each run of samples) in place of every sample. These check that it draws what it draws from the
- * samples where the runs line up with the columns, and a peak within a column of where it was where they do
- * not, that nothing changes when the option is off or the waveform is zoomed in, and that the summary is made
+ * samples where the runs line up with the columns, and a peak within half a column of where it was where they
+ * do not, that nothing changes when the option is off or the waveform is zoomed in, and that the summary is made
  * only when it is needed.
  */
 
@@ -295,16 +295,14 @@ describe('Renderer with a peak pyramid', () => {
   })
 
   describe('where the runs of samples do not line up with the columns', () => {
-    // One peak in silence, and which column it is drawn in
     const LENGTH = 300_000
     const WIDTH = 80
-    const SAMPLES_PER_COLUMN = LENGTH / WIDTH // 3750: a level of 512 is drawn
-    const BUCKET = 512
 
+    // One peak in silence, and which column it is drawn in
     const columnOfPeak = (calls: Call[]): number => {
       const half = 20 // the middle of a waveform 40 high
       let column = -1
-      let tallest = 0
+      let tallest = 1 // every column is drawn at least one high, so a peak is what is taller than that
       for (const [, what, x, y] of calls) {
         if (what !== 'lineTo') continue
         const height = Math.abs((y as number) - half)
@@ -316,40 +314,62 @@ describe('Renderer with a peak pyramid', () => {
       return column
     }
 
-    test('draws a peak in the column it is in, or the next to it, and in the same one far from an edge', async () => {
-      const channel = new Float32Array(LENGTH)
-      const withPyramid = create({ peakPyramid: true }, WIDTH)
-      const withSamples = create({}, WIDTH)
-      const edge = (c: number) => (c + 0.5) * SAMPLES_PER_COLUMN // where drawing the samples starts column c + 1
+    // A peak is drawn at the start of its bucket, up to one bucket before where its sample is, and the last
+    // bucket is drawn whole although it is short, which stretches the level by up to one bucket more. Buckets are
+    // at most a quarter of a column, so a peak is drawn within half a column of where the sample is.
+    describe.each([
+      [LENGTH, WIDTH, 512],
+      // one sample into its last bucket: the level is stretched by nearly a whole bucket
+      [808 * 256 + 1, 200, 256],
+    ])('%i samples in %i columns, drawn from buckets of %i', (length, width, bucket) => {
+      const samplesPerColumn = length / width
+      const edge = (c: number) => (c + 0.5) * samplesPerColumn // where drawing the samples starts column c + 1
 
-      // beside the edges of the columns, and on a spread of places over the whole of the audio
-      const places: number[] = []
-      for (const c of [2, 20, 50, 77])
-        for (const d of [-700, -300, -10, 0, 10, 300, 700]) places.push(Math.floor(edge(c)) + d)
-      for (let k = 0; k < 30; k++) places.push(Math.floor(((k * 0.6180339887) % 1) * (LENGTH - 1)))
+      test('draws a peak in the column it is in, or the next to it, and in the same one far from an edge', async () => {
+        const channel = new Float32Array(length)
+        const withPyramid = create({ peakPyramid: true }, width)
+        const withSamples = create({}, width)
 
-      let differing = 0
-      for (const place of places) {
-        channel[place] = 1
-        const [onSamples, onPyramid] = [
-          columnOfPeak(await drawn(withSamples, [channel])),
-          columnOfPeak(await drawn(withPyramid, [channel])),
-        ]
-        channel[place] = 0
+        // beside the edges of the columns, in the last, short bucket and just before it, and on a spread of
+        // places over the whole of the audio
+        const places: number[] = []
+        for (const c of [2, Math.floor(width / 4), Math.floor(width / 2), width - 3]) {
+          for (const d of [-700, -300, -10, 0, 10, 300, 700]) places.push(Math.floor(edge(c)) + d)
+        }
+        for (const d of [0, 1, 50, 300, 700]) places.push(length - 1 - d)
+        for (let k = 0; k < 30; k++) places.push(Math.floor(((k * 0.6180339887) % 1) * (length - 1)))
 
-        expect(Math.abs(onPyramid - onSamples)).toBeLessThanOrEqual(1)
-        // a bucket is drawn whole, and the last is short of its run by under one bucket of the audio, so a peak
-        // more than two buckets from an edge is drawn where the sample is
-        const distance = Math.min(...Array.from({ length: WIDTH }, (_, c) => Math.abs(place - edge(c))))
-        if (distance > 2 * BUCKET) expect(onPyramid).toBe(onSamples)
-        if (onPyramid !== onSamples) differing++
-      }
+        let differing = 0
+        for (const place of places) {
+          channel[place] = 1
+          const [onSamples, onPyramid] = [
+            columnOfPeak(await drawn(withSamples, [channel])),
+            columnOfPeak(await drawn(withPyramid, [channel])),
+          ]
+          channel[place] = 0
 
-      // the places beside the edges are there to show the peak can be drawn in the next column
-      expect(differing).toBeGreaterThan(0)
-      expect(levelForSpy.mock.results.some((result) => result.value !== null)).toBe(true)
-      withPyramid.destroy()
-      withSamples.destroy()
+          if (onSamples === -1) {
+            // Drawing the samples leaves out those in the last half column, as it always has; a level can draw a
+            // bucket of them, in the last column
+            expect(onPyramid === -1 || onPyramid === width - 1).toBe(true)
+            continue
+          }
+          expect(Math.abs(onPyramid - onSamples)).toBeLessThanOrEqual(1)
+          // two buckets is the furthest a peak is drawn from its sample, so one further than that from an edge
+          // is drawn in the column the sample is in
+          const distance = Math.min(...Array.from({ length: width }, (_, c) => Math.abs(place - edge(c))))
+          if (distance > 2 * bucket) expect(onPyramid).toBe(onSamples)
+          if (onPyramid !== onSamples) differing++
+        }
+
+        // the places beside the edges are there to show the peak can be drawn in the next column
+        expect(differing).toBeGreaterThan(0)
+        expect(levelForSpy.mock.results.some((result) => result.value?.length === Math.ceil(length / bucket))).toBe(
+          true,
+        )
+        withPyramid.destroy()
+        withSamples.destroy()
+      })
     })
 
     test('draws a peak that is the largest of all at the height drawing the samples draws it', async () => {
