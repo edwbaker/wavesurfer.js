@@ -560,3 +560,25 @@ export function calculateLinePaths({
 export function roundToHalfAwayFromZero(value: number): number {
   return Math.sign(value) * Math.round(Math.abs(value))
 }
+
+/**
+ * How many samples of the audio one column of the waveform covers: a pixel for a line, and a bar with the gap
+ * after it for bars. It is the same grid `calculateBarRenderConfig` draws, and the figure a peak pyramid
+ * chooses its level by.
+ */
+export function calculateSamplesPerColumn({
+  length,
+  width,
+  options,
+  pixelRatio,
+}: {
+  length: number
+  width: number
+  options: WaveSurferOptions
+  pixelRatio: number
+}): number {
+  if (!(width > 0)) return 0
+  const { barWidth, barGap } = resolveBarDimensions(options, pixelRatio)
+  const columnWidth = shouldRenderBars(options) ? barWidth + barGap || 1 : 1
+  return (length * columnWidth) / width
+}

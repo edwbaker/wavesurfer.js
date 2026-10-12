@@ -5,6 +5,7 @@ import { createDragStream, type DragEvent } from './reactive/drag-stream.js'
 import { createScrollStream, type ScrollPercentages, type ScrollStream } from './reactive/scroll-stream.js'
 import { computed, effect, signal, type ComputedSignal, type Signal } from './reactive/store.js'
 import { Scope } from './scope.js'
+import { MIN_SAMPLES_PER_COLUMN, PeakPyramid } from './peak-pyramid.js'
 
 type ChannelData = utils.ChannelData
 
@@ -38,6 +39,8 @@ class Renderer {
   // non-scrollable early-return branch.
   private isScrollable = signal(false)
   private audioData: AudioBuffer | null = null
+  // The peak pyramid of each channel of the audio, made the first time a render needs it (see `peakPyramid`)
+  private pyramids = new WeakMap<AudioBuffer, PeakPyramid[]>()
   private lastContainerWidth = 0
   private isDragging = false
   private lastProgress: number | undefined
@@ -796,6 +799,49 @@ class Renderer {
     }
   }
 
+  private getPyramid(audioData: AudioBuffer, channelIndex: number): PeakPyramid {
+    let pyramids = this.pyramids.get(audioData)
+    if (!pyramids) this.pyramids.set(audioData, (pyramids = []))
+    const channel = audioData.getChannelData(channelIndex)
+    // A pyramid summarises the samples as they were when it was made, and is kept for as long as the AudioBuffer
+    // is: turning `peakPyramid` off and on again does not make a new one. A new AudioBuffer (loading audio, or the
+    // `peaks` option, which makes one) makes a new one, and a change of length is caught here, but samples written
+    // to in place are not seen.
+    let pyramid = pyramids[channelIndex]
+    if (!pyramid || pyramid.length !== channel.length) pyramid = pyramids[channelIndex] = new PeakPyramid(channel)
+    return pyramid
+  }
+
+  /**
+   * The data to draw for these channels of the audio. With `peakPyramid` on, a waveform zoomed out far enough is
+   * drawn from a level of each channel's peak pyramid, a summary of it, in place of every sample, and `normalize`
+   * takes the peak from the pyramid rather than from the samples. Otherwise it is the samples themselves, which a
+   * custom renderFunction is always given.
+   */
+  private resolveChannelData(
+    audioData: AudioBuffer,
+    channelIndexes: number[],
+    options: WaveSurferOptions,
+    width: number,
+  ): { channelData: ChannelData; options: WaveSurferOptions } {
+    const channels = channelIndexes.map((index) => audioData.getChannelData(index))
+    if (!options.peakPyramid || options.renderFunction) return { channelData: channels, options }
+
+    const pixelRatio = this.getPixelRatio()
+    const samplesPerColumn = channels.map((channel) =>
+      utils.calculateSamplesPerColumn({ length: channel.length, width, options, pixelRatio }),
+    )
+    const needsLevels = samplesPerColumn.some((samples) => samples >= MIN_SAMPLES_PER_COLUMN)
+    const needsPeak = Boolean(options.normalize) && options.maxPeak == null
+    // Zoomed in, what is in view holds few samples, and a pyramid is not made for it
+    if (!needsLevels && !needsPeak) return { channelData: channels, options }
+
+    const pyramids = channelIndexes.map((index) => this.getPyramid(audioData, index))
+    const channelData = channels.map((channel, k) => pyramids[k].levelFor(samplesPerColumn[k]) ?? channel)
+    if (needsPeak) options = { ...options, maxPeak: Math.max(...pyramids.map((pyramid) => pyramid.peak)) }
+    return { channelData, options }
+  }
+
   private renderChannel(
     channelData: ChannelData,
     { overlay, ...options }: WaveSurferOptions & { overlay?: boolean },
@@ -896,13 +942,14 @@ class Renderer {
       // Render a waveform for each channel
       for (let i = 0; i < audioData.numberOfChannels; i++) {
         const options = { ...this.options, ...this.options.splitChannels?.[i] }
-        this.renderChannel([audioData.getChannelData(i)], options, width, i)
+        const { channelData, options: drawOptions } = this.resolveChannelData(audioData, [i], options, width)
+        this.renderChannel(channelData, drawOptions, width, i)
       }
     } else {
       // Render a single waveform for the first two channels (left and right)
-      const channels = [audioData.getChannelData(0)]
-      if (audioData.numberOfChannels > 1) channels.push(audioData.getChannelData(1))
-      this.renderChannel(channels, this.options, width, 0)
+      const indexes = audioData.numberOfChannels > 1 ? [0, 1] : [0]
+      const { channelData, options } = this.resolveChannelData(audioData, indexes, this.options, width)
+      this.renderChannel(channelData, options, width, 0)
     }
 
     // Must be bumped asynchronously for backward compatibility (the public
