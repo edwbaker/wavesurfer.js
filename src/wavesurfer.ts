@@ -80,6 +80,19 @@ export type WaveSurferOptions = {
   normalize?: boolean
   /** Use a fixed max peak value for normalization instead of calculating from the current data */
   maxPeak?: number
+  /**
+   * Draw a waveform that is zoomed out from a summary of the audio (the largest sample in each run of 256, and
+   * in each run of those) in place of every sample, so that fitting a long recording to the width reads a
+   * fraction of it. The first zoomed-out render reads all of the audio once to make the summary, which takes
+   * under 1% more memory than the audio. With it on, `normalize` also reads its peak from the summary, at any
+   * zoom.
+   *
+   * A peak is drawn within a quarter of a column of where drawing the samples puts it, and where the runs line up
+   * with the columns nothing differs. The summary is of the audio as it was when it was made: a change to the
+   * samples in place is drawn only after loading the audio again. A custom `renderFunction` is always given the
+   * samples. Off by default.
+   */
+  peakPyramid?: boolean
   /** The list of plugins to initialize on start */
   plugins?: GenericPlugin[]
   /** Custom render function */
