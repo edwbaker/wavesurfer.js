@@ -275,6 +275,384 @@ describe('Renderer', () => {
     expect(scrollContainer.style.width).toBe('')
   })
 
+  // #4055: a fill-parent waveform that overflows its container must not also widen it, or a
+  // shrinkable container (e.g. a `flex: 1` item) grows to fit it and the resize observer
+  // re-renders in a loop. jsdom does no layout, so the container's width is simulated.
+  describe('containing the scroll area of a fill-parent waveform', () => {
+    type Layout = { waveformWidth: number | null; contained: boolean }
+
+    // `containerWidth` is the width of the scroll area's content as a function of the waveform's width and of
+    // whether the scroll area is contained. `ownWidth` is what the container is wide without the scroll area,
+    // the only time the renderer looks at the host (any other time it would count the waveform too, so the
+    // simulation answers with a wrong width). `padding` is added to the `clientWidth` the renderer reads, as a
+    // page that pads the `scroll` part would.
+    const setUp = (
+      containerWidth: (layout: Layout) => number,
+      {
+        ownWidth = 600,
+        padding = 0,
+        ...options
+      }: { ownWidth?: number | (() => number); padding?: number; [key: string]: unknown } = {},
+    ) => {
+      const scrollContainer = (renderer as any).scrollContainer as HTMLElement
+      const wrapper = (renderer as any).wrapper as HTMLElement
+      const host = (renderer as any).container as HTMLElement
+      ;(renderer as any).containerInlinePadding = padding
+      Object.defineProperty(scrollContainer, 'clientWidth', {
+        configurable: true,
+        // a whole number, as the browser reports it
+        get: () =>
+          Math.round(
+            padding +
+              containerWidth({
+                // null until the wrapper is given a pixel width (it is '100%' or unset otherwise)
+                waveformWidth: wrapper.style.width.endsWith('px') ? parseFloat(wrapper.style.width) : null,
+                contained: scrollContainer.style.contain === 'inline-size',
+              }),
+          ),
+      })
+      Object.defineProperty(host, 'offsetWidth', {
+        configurable: true,
+        get: () =>
+          scrollContainer.style.display === 'none' ? (typeof ownWidth === 'function' ? ownWidth() : ownWidth) : 99999,
+      })
+      renderer.setOptions({ ...(renderer as any).options, fillParent: true, minPxPerSec: 100, ...options })
+      return scrollContainer
+    }
+    // 100 seconds at 100px/s is 10000px: much wider than any container below
+    const overflowing = createAudioBuffer([[0, 0.5, -0.5]], 100)
+
+    describe('when the waveform widens the container', () => {
+      test('contains a container that is widened by the waveform, such as a flex item', async () => {
+        // Has a share of 600px by itself, but grows to fit the waveform unless it is contained
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+        expect(scrollContainer.clientWidth).toBe(600)
+        // Hidden only while its container was measured
+        expect(scrollContainer.style.display).toBe('')
+      })
+
+      test('keeps it contained on later renders, and lets go once the waveform fits', async () => {
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        await renderer.render(overflowing)
+        renderer.reRender()
+        expect(scrollContainer.style.contain).toBe('inline-size')
+
+        renderer.zoom(0) // fills the container now
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('contains a container that an earlier render left stretched', async () => {
+        // The width measured before rendering is the stretched one (10000px), not the container's own
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 10000)), {
+          minPxPerSec: 200, // 100 seconds at 200px/s is 20000px: wider than the stretched container
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+        expect(scrollContainer.clientWidth).toBe(600)
+      })
+
+      test('contains a container that the waveform has widened when the padding is not a whole number of pixels', async () => {
+        // The browser rounds clientWidth: 10000.4px of scroll area is reported as 10000, which less the 0.4px of padding
+        // is a little under the waveform's width
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)), {
+          padding: 0.4,
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+      })
+    })
+
+    describe('what it leaves alone', () => {
+      test('leaves a container with a definite width alone', async () => {
+        const scrollContainer = setUp(() => 600)
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('leaves a container that has no width without the waveform alone', async () => {
+        // It is as wide as the waveform makes it, e.g. a content-sized flex item
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 1 : (waveformWidth ?? 400)), {
+          ownWidth: 1,
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+        expect(scrollContainer.style.display).toBe('')
+      })
+
+      test('leaves a container that only shrinks to fit the waveform alone', async () => {
+        // A content-sized flex item with a `min-width` of 100px: it is as wide as its row allows (600px),
+        // and containing the waveform would squeeze it to that 100px floor
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => (contained ? 100 : Math.min(waveformWidth ?? 100, 600)),
+          { ownWidth: 100 },
+        )
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+        expect(scrollContainer.clientWidth).toBe(600)
+      })
+
+      test('leaves a container that is capped below the waveform alone', async () => {
+        // e.g. `max-width: 900px`: it grows with the waveform, but never to hold all of it
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => (contained ? 400 : Math.min(waveformWidth ?? 400, 900)),
+          { ownWidth: 400 },
+        )
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('does nothing when the waveform fits its container', async () => {
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)), {
+          minPxPerSec: 0,
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('does nothing when the waveform is not asked to fill its parent', async () => {
+        // It has a width of its own and is meant to size its container
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)), {
+          fillParent: false,
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('does not take padding on the scroll area for a width of the container', async () => {
+        // A page can pad the scroll area through its `scroll` part. A container sized by its content is as wide as
+        // that padding before the waveform renders, and with the waveform contained it is still as wide as the
+        // padding: more than the 1px floor, but not a width of its own
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 0 : (waveformWidth ?? 0)), {
+          ownWidth: 1,
+          padding: 32,
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('leaves a container alone that is narrower than the waveform by less than the padding of the scroll area', async () => {
+        // A content-sized flex item with a `min-width`, given 9990px by its row: the padding makes the scroll area
+        // as wide as the waveform (10022px against 10000px), but the waveform has not widened the container
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => (contained ? 100 : Math.min(waveformWidth ?? 100, 9990)),
+          { ownWidth: 100, padding: 32 },
+        )
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+    })
+
+    describe('how the container is measured', () => {
+      test('hides the scroll area with an important declaration, which a rule on its part cannot override', async () => {
+        // A page rule such as `::part(scroll) { display: block }` wins over a normal inline declaration
+        let priority: string | undefined
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)), {
+          ownWidth: () => {
+            priority = ((renderer as any).scrollContainer as HTMLElement).style.getPropertyPriority('display')
+            return 600
+          },
+        })
+        await renderer.render(overflowing)
+        expect(priority).toBe('important')
+        expect(scrollContainer.style.display).toBe('')
+      })
+
+      test('puts back an inline display that custom code gave the scroll area, with its priority', async () => {
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        scrollContainer.style.setProperty('display', 'flex', 'important')
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.getPropertyValue('display')).toBe('flex')
+        expect(scrollContainer.style.getPropertyPriority('display')).toBe('important')
+      })
+    })
+
+    describe('a contain that custom code set on the scroll area', () => {
+      test('leaves a contain that custom code set on the scroll area alone', async () => {
+        // Where the waveform would be contained, and where it fits and any containment would be taken off
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        scrollContainer.style.contain = 'paint'
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('paint')
+
+        renderer.zoom(0)
+        expect(scrollContainer.style.contain).toBe('paint')
+      })
+
+      test('leaves an inline-size that custom code set on the scroll area alone, as it did not come from here', async () => {
+        // The same value as the renderer's own, so only knowing who set it tells them apart
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        scrollContainer.style.contain = 'inline-size'
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+
+        renderer.zoom(0) // fits now, so a containment of the renderer's would be taken off
+        expect(scrollContainer.style.contain).toBe('inline-size')
+      })
+
+      test('leaves an important inline-size that custom code put in its place alone', async () => {
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size') // the renderer's own
+
+        scrollContainer.style.setProperty('contain', 'inline-size', 'important')
+        renderer.zoom(0) // fits now, so a containment of the renderer's would be taken off
+        expect(scrollContainer.style.getPropertyValue('contain')).toBe('inline-size')
+        expect(scrollContainer.style.getPropertyPriority('contain')).toBe('important')
+      })
+    })
+
+    describe('a scroll area that follows the waveform', () => {
+      test('lets go of a scroll area that collapses once contained, as one sized by its content does', async () => {
+        // e.g. a `width` of `max-content`, however it is written: asked for, so not an accident to contain
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 0 : (waveformWidth ?? 600)))
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('lets go of a scroll area that is already contained once it is asked to follow the waveform', async () => {
+        // The width is changed while it is contained: contained, `max-content` leaves it no width at all
+        const scrollContainer = setUp(({ waveformWidth, contained }) => {
+          if (!contained) return waveformWidth ?? 600
+          return (renderer as any).options.width === 'max-content' ? 0 : 600
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+
+        renderer.setOptions({ ...(renderer as any).options, width: 'max-content' })
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('lets go of a contained scroll area that collapses on its own, without the container being resized', async () => {
+        // e.g. a rule on the part gives it `width: max-content` after it was contained
+        let collapsed = false
+        const scrollContainer = setUp(({ waveformWidth, contained }) =>
+          contained ? (collapsed ? 0 : 600) : (waveformWidth ?? 600),
+        )
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+
+        collapsed = true
+        // What the resize observer calls when the scroll area changes size: the parent is as wide as before
+        ;(renderer as any).onContainerResize()
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('does not look at how the width is written, only at what it does', async () => {
+        // Written with a custom property that happens to hold the word `content`, it still fills the container
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)), {
+          width: 'var(--content-width)',
+        })
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+      })
+    })
+
+    describe('when the waveform is moved to another container', () => {
+      test('decides again when the waveform is moved to another container', async () => {
+        // First in a flex item that has a width of its own, then in a container that is sized by its content
+        let contentSized = false
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => {
+            if (contentSized) return contained ? 1 : (waveformWidth ?? 400)
+            return contained ? 600 : (waveformWidth ?? 600)
+          },
+          { ownWidth: () => (contentSized ? 1 : 600) },
+        )
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+
+        contentSized = true
+        const elsewhere = document.createElement('div')
+        document.body.appendChild(elsewhere)
+        renderer.setOptions({ ...(renderer as any).options, container: elsewhere })
+        // Not held on to from the old container: the new one has no width without the waveform
+        expect(scrollContainer.style.contain).toBe('')
+        elsewhere.remove()
+      })
+
+      test('measures the container it is moved to without the old width of the waveform in it', async () => {
+        // Both are flex items with a share of 600px of their own. Measured with the waveform's old width still in the
+        // scroll area, the new one would be stretched to hold it, and the waveform would count as fitting
+        const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)))
+        await renderer.render(overflowing)
+
+        const elsewhere = document.createElement('div')
+        document.body.appendChild(elsewhere)
+        renderer.setOptions({ ...(renderer as any).options, container: elsewhere })
+        expect(scrollContainer.style.contain).toBe('inline-size')
+        expect(((renderer as any).wrapper as HTMLElement).style.width).toBe('10000px')
+        elsewhere.remove()
+      })
+    })
+
+    describe('when the container is resized', () => {
+      // What the resize observer ends up calling, once the parent's width has changed
+      let parentWidth = 600
+      const resize = (width: number) => {
+        parentWidth = width
+        ;(renderer as any).onContainerResize()
+      }
+      beforeEach(() => {
+        parentWidth = 600
+        Object.defineProperty((renderer as any).parent, 'clientWidth', { configurable: true, get: () => parentWidth })
+      })
+
+      test('lets go of the containment once the container no longer has a width of its own', async () => {
+        // e.g. a media query turns a flex item into one that is sized by its content
+        let contentSized = false
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => {
+            if (contentSized) return contained ? 1 : (waveformWidth ?? 400)
+            return contained ? 600 : (waveformWidth ?? 600)
+          },
+          { ownWidth: () => (contentSized ? 1 : 600) },
+        )
+        await renderer.render(overflowing)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+
+        contentSized = true
+        resize(1)
+        expect(scrollContainer.style.contain).toBe('')
+      })
+
+      test('keeps the containment while the container still has a width of its own', async () => {
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => (contained ? parentWidth : (waveformWidth ?? parentWidth)),
+          { ownWidth: () => parentWidth },
+        )
+        await renderer.render(overflowing)
+
+        resize(500)
+        expect(scrollContainer.style.contain).toBe('inline-size')
+      })
+
+      test('only looks for it on a resize, not on every render', async () => {
+        let looks = 0
+        const scrollContainer = setUp(
+          ({ waveformWidth, contained }) => (contained ? parentWidth : (waveformWidth ?? parentWidth)),
+          {
+            ownWidth: () => {
+              looks++
+              return parentWidth
+            },
+          },
+        )
+        await renderer.render(overflowing)
+        expect(looks).toBe(1) // when it started being contained
+
+        renderer.zoom(150)
+        renderer.reRender()
+        expect(scrollContainer.style.contain).toBe('inline-size')
+        expect(looks).toBe(1)
+
+        resize(550)
+        expect(looks).toBe(2)
+      })
+    })
+  })
+
   test('scrollIntoView updates scroll', () => {
     Object.defineProperty((renderer as any).scrollContainer, 'scrollWidth', { configurable: true, value: 100 })
     Object.defineProperty((renderer as any).scrollContainer, 'clientWidth', { configurable: true, value: 50 })
