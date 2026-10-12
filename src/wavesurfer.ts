@@ -84,8 +84,8 @@ export type WaveSurferOptions = {
    * Draw a waveform that is zoomed out from a summary of the audio (the largest sample in each run of 256, and
    * in each run of those) in place of every sample, so that fitting a long recording to the width reads a
    * fraction of it. The first zoomed-out render reads all of the audio once to make the summary, which takes
-   * under 1% more memory than the audio. With it on, `normalize` also reads its peak from the summary, at any
-   * zoom.
+   * about 0.8% more memory than the audio (a value for each 128 samples) for all but very short audio. With it
+   * on, `normalize` also reads its peak from the summary, at any zoom.
    *
    * A peak is drawn within half a column of where drawing the samples puts it, and where the runs line up with
    * the columns nothing differs. The summary is of the audio as it was when it was made: a change to the

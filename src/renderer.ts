@@ -803,8 +803,10 @@ class Renderer {
     let pyramids = this.pyramids.get(audioData)
     if (!pyramids) this.pyramids.set(audioData, (pyramids = []))
     const channel = audioData.getChannelData(channelIndex)
-    // A pyramid summarises the samples as they were when it was made: after the audio is written to in place,
-    // a new `peakPyramid` option (or a new AudioBuffer) makes a new one. A change of length is caught here.
+    // A pyramid summarises the samples as they were when it was made, and is kept for as long as the AudioBuffer
+    // is: turning `peakPyramid` off and on again does not make a new one. A new AudioBuffer (loading audio, or the
+    // `peaks` option, which makes one) makes a new one, and a change of length is caught here, but samples written
+    // to in place are not seen.
     let pyramid = pyramids[channelIndex]
     if (!pyramid || pyramid.length !== channel.length) pyramid = pyramids[channelIndex] = new PeakPyramid(channel)
     return pyramid
