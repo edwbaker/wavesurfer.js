@@ -327,7 +327,8 @@ class Renderer {
    * of its own without it. A container with a definite width, one that only shrinks to fit or is capped by a
    * `max-width`, and one with no width without the waveform (a content-sized flex item, an inline-block, a
    * float, a table cell) are left as they are. Once contained it stays so while the waveform overflows, and a
-   * resize of the container checks that it still has a width of its own (a media query may have changed it).
+   * resize of the container checks that it still has a width of its own (a media query may have changed it), unless
+   * it is not displayed, when there is nothing to check.
    *
    * A `contain` that a page sets on the exposed `scroll` part wins over the inline one, and an inline one set
    * by custom code is left alone: only the renderer's own `inline-size` is ever set or cleared.
@@ -346,7 +347,7 @@ class Renderer {
     // Contained renders measure the container's own width. The scroll area may have collapsed since, if it was
     // asked to follow the waveform (a new `width`, a rule on its part)
     if (this.isContained()) {
-      if (recheck && !this.hasWidthWithoutScrollArea()) this.releaseContainment()
+      if (recheck && !this.hasWidthWithoutScrollArea() && this.isDisplayed()) this.releaseContainment()
       else this.releaseIfCollapsed()
       return
     }
@@ -375,7 +376,19 @@ class Renderer {
 
   /** A scroll area sized by its content on purpose (`width: max-content`, however written) collapses contained */
   private releaseIfCollapsed() {
-    if (this.isContained() && this.scrollContainer.clientWidth <= this.containerInlinePadding) this.releaseContainment()
+    const el = this.scrollContainer
+    if (this.isContained() && el.clientWidth <= this.containerInlinePadding && this.isDisplayed()) {
+      this.releaseContainment()
+    }
+  }
+
+  /**
+   * Whether the container takes part in the layout. Nothing in a `display: none` ancestor has a size, which says
+   * nothing of how wide the container is: what was decided for it stands until it is shown again. Asked of the
+   * box, not of the width: a displayed container can be 0 wide.
+   */
+  private isDisplayed(): boolean {
+    return this.container.getClientRects().length > 0
   }
 
   /**

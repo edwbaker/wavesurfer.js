@@ -286,13 +286,20 @@ describe('Renderer', () => {
     // the only time the renderer looks at the host (any other time it would count the waveform too, so the
     // simulation answers with a wrong width). `padding` is added to the `clientWidth` the renderer reads, as a
     // page that pads the `scroll` part would; a function gives the padding of wherever the waveform is now.
+    // `displayed` says whether the container has a box at all: not when an ancestor is `display: none`.
     const setUp = (
       containerWidth: (layout: Layout) => number,
       {
         ownWidth = 600,
         padding = 0,
+        displayed = () => true,
         ...options
-      }: { ownWidth?: number | (() => number); padding?: number | (() => number); [key: string]: unknown } = {},
+      }: {
+        ownWidth?: number | (() => number)
+        padding?: number | (() => number)
+        displayed?: () => boolean
+        [key: string]: unknown
+      } = {},
     ) => {
       const scrollContainer = (renderer as any).scrollContainer as HTMLElement
       const wrapper = (renderer as any).wrapper as HTMLElement
@@ -314,8 +321,16 @@ describe('Renderer', () => {
       })
       Object.defineProperty(host, 'offsetWidth', {
         configurable: true,
-        get: () =>
-          scrollContainer.style.display === 'none' ? (typeof ownWidth === 'function' ? ownWidth() : ownWidth) : 99999,
+        get: () => {
+          if (!displayed()) return 0
+          if (scrollContainer.style.display !== 'none') return 99999
+          return typeof ownWidth === 'function' ? ownWidth() : ownWidth
+        },
+      })
+      // jsdom has no boxes: an element has none unless it is told so
+      Object.defineProperty(host, 'getClientRects', {
+        configurable: true,
+        value: () => (displayed() ? [{}] : []),
       })
       renderer.setOptions({ ...(renderer as any).options, fillParent: true, minPxPerSec: 100, ...options })
       return scrollContainer
@@ -726,6 +741,72 @@ describe('Renderer', () => {
 
         resize(550)
         expect(looks).toBe(2)
+      })
+
+      describe('when an ancestor of the container is hidden', () => {
+        // `display: none` on an ancestor leaves everything in it without a size: the container, the host and the
+        // scroll area are all 0 wide, which says nothing about whether the container has a width of its own
+        let hidden = false
+        const setUpFlexItem = () =>
+          setUp(
+            ({ waveformWidth, contained }) => {
+              if (hidden) return 0
+              return contained ? parentWidth : (waveformWidth ?? parentWidth)
+            },
+            { ownWidth: () => parentWidth, displayed: () => !hidden },
+          )
+
+        beforeEach(() => {
+          hidden = false
+        })
+
+        test('keeps the containment while the container is hidden', async () => {
+          const scrollContainer = setUpFlexItem()
+          await renderer.render(overflowing)
+          resize(600) // the resize observer reports the container once it is observed
+          expect(scrollContainer.style.contain).toBe('inline-size')
+
+          hidden = true
+          resize(0)
+          expect(scrollContainer.style.contain).toBe('inline-size')
+        })
+
+        test('does not widen the container when it is shown again', async () => {
+          const scrollContainer = setUpFlexItem()
+          await renderer.render(overflowing)
+          resize(600)
+          hidden = true
+          resize(0)
+
+          // Laid out as soon as it is shown, before the resize observer reports it: a waveform that is no longer
+          // contained is as wide as it renders, 10000px, and stretches the container to hold it
+          hidden = false
+          parentWidth = 600
+          expect(scrollContainer.clientWidth).toBe(600)
+
+          resize(600)
+          expect(scrollContainer.style.contain).toBe('inline-size')
+          expect(scrollContainer.clientWidth).toBe(600)
+        })
+
+        test('still lets go of a container that is displayed but has no width of its own', async () => {
+          // e.g. a content-sized flex item whose page took away the host's 1px floor: 0 wide, but not hidden
+          let contentSized = false
+          const scrollContainer = setUp(
+            ({ waveformWidth, contained }) => {
+              if (contentSized) return contained ? 1 : (waveformWidth ?? 400)
+              return contained ? 600 : (waveformWidth ?? 600)
+            },
+            { ownWidth: () => (contentSized ? 0 : 600) },
+          )
+          await renderer.render(overflowing)
+          resize(600)
+          expect(scrollContainer.style.contain).toBe('inline-size')
+
+          contentSized = true
+          resize(1)
+          expect(scrollContainer.style.contain).toBe('')
+        })
       })
     })
   })
