@@ -129,16 +129,18 @@ const create = async () => {
   const rate = Number(rateSelect.value)
   const seconds = Number(minutesSelect.value) * 60
   const channels = Number(channelsSelect.value)
-  samples = rate * seconds
+  // Only a recording that is made is the one shown, so `samples` is set once it is known to be allowed
+  const length = rate * seconds
 
-  if (samples * channels > MAX_SAMPLES) {
+  if (length * channels > MAX_SAMPLES) {
     setStatus(
-      `That is ${million(samples * channels)} samples, and this page makes up to ${million(MAX_SAMPLES)}. ` +
+      `That is ${million(length * channels)} samples, and this page makes up to ${million(MAX_SAMPLES)}. ` +
         'Choose a lower sample rate, a shorter recording or fewer channels.',
     )
     return
   }
 
+  samples = length
   setBusy(true)
   setStatus(`Making ${million(samples * channels)} samples...`)
   // Let the message be painted before the page is busy making them
