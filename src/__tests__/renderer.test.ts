@@ -285,25 +285,26 @@ describe('Renderer', () => {
     // whether the scroll area is contained. `ownWidth` is what the container is wide without the scroll area,
     // the only time the renderer looks at the host (any other time it would count the waveform too, so the
     // simulation answers with a wrong width). `padding` is added to the `clientWidth` the renderer reads, as a
-    // page that pads the `scroll` part would.
+    // page that pads the `scroll` part would; a function gives the padding of wherever the waveform is now.
     const setUp = (
       containerWidth: (layout: Layout) => number,
       {
         ownWidth = 600,
         padding = 0,
         ...options
-      }: { ownWidth?: number | (() => number); padding?: number; [key: string]: unknown } = {},
+      }: { ownWidth?: number | (() => number); padding?: number | (() => number); [key: string]: unknown } = {},
     ) => {
       const scrollContainer = (renderer as any).scrollContainer as HTMLElement
       const wrapper = (renderer as any).wrapper as HTMLElement
       const host = (renderer as any).container as HTMLElement
-      ;(renderer as any).containerInlinePadding = padding
+      const paddingNow = () => (typeof padding === 'function' ? padding() : padding)
+      ;(renderer as any).containerInlinePadding = paddingNow()
       Object.defineProperty(scrollContainer, 'clientWidth', {
         configurable: true,
         // a whole number, as the browser reports it
         get: () =>
           Math.round(
-            padding +
+            paddingNow() +
               containerWidth({
                 // null until the wrapper is given a pixel width (it is '100%' or unset otherwise)
                 waveformWidth: wrapper.style.width.endsWith('px') ? parseFloat(wrapper.style.width) : null,
@@ -584,6 +585,82 @@ describe('Renderer', () => {
         expect(scrollContainer.style.contain).toBe('inline-size')
         expect(((renderer as any).wrapper as HTMLElement).style.width).toBe('10000px')
         elsewhere.remove()
+      })
+
+      // Two containers as wide as each other leave the resize observer nothing to report, so nothing but the move
+      // itself can refresh what the renderer knows of the scroll area. jsdom has no layout and no `::part()`, so the
+      // padding that a page rule would give the scroll area of each container is answered from the one it is in.
+      describe('when the scroll area is padded differently there', () => {
+        let paddings: Map<Element, number>
+        let getComputedStyleSpy: jest.SpyInstance
+        let elsewhere: HTMLDivElement
+        const paddingHere = () => paddings.get(((renderer as any).container as HTMLElement).parentElement!) ?? 0
+
+        beforeEach(() => {
+          elsewhere = document.createElement('div')
+          document.body.appendChild(elsewhere)
+          paddings = new Map()
+          const getComputedStyle = window.getComputedStyle.bind(window)
+          getComputedStyleSpy = jest.spyOn(window, 'getComputedStyle').mockImplementation((el, pseudo) => {
+            if (el !== (renderer as any).scrollContainer) return getComputedStyle(el, pseudo)
+            const side = `${paddingHere() / 2}px`
+            return { paddingLeft: side, paddingRight: side } as CSSStyleDeclaration
+          })
+        })
+
+        afterEach(() => {
+          getComputedStyleSpy.mockRestore()
+          elsewhere.remove()
+        })
+
+        test('decides about containment with the padding of the container it is moved to', async () => {
+          // Both are flex items with a share of 600px of their own. The padding the waveform left (40px) is taken off
+          // the width of the scroll area it has widened (10000px of waveform and none of padding): that is a little
+          // under the waveform, and the container would be taken for one the waveform has not widened
+          paddings.set(container, 40)
+          paddings.set(elsewhere, 0)
+          const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 600 : (waveformWidth ?? 600)), {
+            padding: paddingHere,
+          })
+          await renderer.render(overflowing)
+          expect(scrollContainer.style.contain).toBe('inline-size')
+
+          renderer.setOptions({ ...(renderer as any).options, container: elsewhere })
+          expect(scrollContainer.style.contain).toBe('inline-size')
+          expect(scrollContainer.clientWidth).toBe(600)
+        })
+
+        test('measures the waveform against the padding of the container it is moved to', async () => {
+          // 620px of waveform overflows the 600px of room the new container leaves inside its padding. Taken off the
+          // old padding (none), the room would be 640px and the waveform would be taken for one that fits
+          paddings.set(container, 0)
+          paddings.set(elsewhere, 40)
+          const scrollContainer = setUp(() => 600, { padding: paddingHere, minPxPerSec: 6.2 })
+          await renderer.render(overflowing)
+          expect(renderer.getWidth()).toBe(600)
+          expect(((renderer as any).wrapper as HTMLElement).style.width).toBe('620px')
+
+          renderer.setOptions({ ...(renderer as any).options, container: elsewhere })
+          expect(scrollContainer.clientWidth).toBe(640)
+          expect(renderer.getWidth()).toBe(600)
+          expect(((renderer as any).wrapper as HTMLElement).style.width).toBe('620px')
+          expect(scrollContainer.style.overflowX).toBe('auto')
+        })
+
+        test('recognises a scroll area that collapses to its padding once contained in the container it is moved to', async () => {
+          // One that follows the waveform (e.g. `width: max-content`) has nothing left but its 40px of padding once
+          // contained. Against the old padding (none) that would not look like a collapse, and it would stay contained
+          paddings.set(container, 0)
+          paddings.set(elsewhere, 40)
+          const scrollContainer = setUp(({ waveformWidth, contained }) => (contained ? 0 : (waveformWidth ?? 600)), {
+            padding: paddingHere,
+          })
+          await renderer.render(overflowing)
+          expect(scrollContainer.style.contain).toBe('')
+
+          renderer.setOptions({ ...(renderer as any).options, container: elsewhere })
+          expect(scrollContainer.style.contain).toBe('')
+        })
       })
     })
 

@@ -492,6 +492,9 @@ class Renderer {
       // position, as moving the host has already reset it
       this.wrapper.style.width = ''
       this.releaseContainment()
+      // Nor does the padding of the old scroll area: a container as wide as the old one gives the resize observer
+      // nothing to report, so the move is the only time to take it from the new one
+      this.calculateInlinePadding()
     }
 
     if (options.dragToSeek === true || typeof options.dragToSeek === 'object') {
