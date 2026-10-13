@@ -19,6 +19,9 @@ const SMOOTH_SCROLL_MAX_DELTA = 10
 const LOW_ZOOM_PIXELS_PER_SECOND_THRESHOLD = SMOOTH_SCROLL_MAX_DELTA * SMOOTH_SCROLL_FPS
 const DRAG_EDGE_SIZE = 50
 const DRAG_MAX_SCROLL_SPEED = 30
+// The waveform's host is never narrower than this (`:host { min-width: 1px }`): a container this wide
+// without the waveform has no width of its own
+const HOST_MIN_WIDTH = 1
 
 class Renderer {
   private options: WaveSurferOptions
@@ -39,6 +42,10 @@ class Renderer {
   private isScrollable = signal(false)
   private audioData: AudioBuffer | null = null
   private lastContainerWidth = 0
+  // Set on a container resize: the next render checks that its containment still suits it
+  private recheckContainment = false
+  // Whether the inline `contain: inline-size` on the scroll area was set by this renderer, not by custom code
+  private ownsContainment = false
   private isDragging = false
   private lastProgress: number | undefined
   private dragClientX: number | null = null
@@ -197,8 +204,13 @@ class Renderer {
     this.scrollStream?.refresh()
     const width = this.parent.clientWidth
     this.calculateInlinePadding()
-    if (width === this.lastContainerWidth && this.options.height !== 'auto') return
+    if (width === this.lastContainerWidth && this.options.height !== 'auto') {
+      // Only the scroll area may have changed size (a rule on its part asking it to follow the waveform)
+      this.releaseIfCollapsed()
+      return
+    }
     this.lastContainerWidth = width
+    this.recheckContainment = true
     this.reRender()
     this._resizeEpoch.update((n) => n + 1)
   }
@@ -305,6 +317,98 @@ class Renderer {
     this.containerInlinePadding = Number.isNaN(padding) ? 0 : padding
   }
 
+  /**
+   * A waveform that fills its parent but overflows it must not also widen it (#4055): its wide content becomes
+   * the container's minimum width, so a container that can shrink, like a `flex: 1` item, grows to hold all of
+   * it; the resize observer re-renders at the new width, where the waveform no longer overflows, the container
+   * shrinks back, and the waveform flickers in a loop. Containing the scroll area's inline size keeps its
+   * content from sizing the container.
+   *
+   * Only done when that is seen to happen: the container has grown to hold the whole waveform and has a width
+   * of its own without it. A container with a definite width, one that only shrinks to fit or is capped by a
+   * `max-width`, and one with no width without the waveform (a content-sized flex item, an inline-block, a
+   * float, a table cell) are left as they are. Once contained it stays so while the waveform overflows, and a
+   * resize of the container checks that it still has a width of its own (a media query may have changed it), unless
+   * it is not displayed, when there is nothing to check.
+   *
+   * A `contain` that a page sets on the exposed `scroll` part wins over the inline one, and an inline one set
+   * by custom code is left alone: only the renderer's own `inline-size` is ever set or cleared.
+   *
+   * @param scrollWidth The width the waveform needs when it overflows the container
+   */
+  private containScrollWidth(scrollWidth: number) {
+    const el = this.scrollContainer
+    const recheck = this.recheckContainment
+    this.recheckContainment = false
+
+    if (!this.options.fillParent || !this.isScrollable.value) {
+      this.releaseContainment()
+      return
+    }
+    // Contained renders measure the container's own width. The scroll area may have collapsed since, if it was
+    // asked to follow the waveform (a new `width`, a rule on its part)
+    if (this.isContained()) {
+      if (recheck && !this.hasWidthWithoutScrollArea() && this.isDisplayed()) this.releaseContainment()
+      else this.releaseIfCollapsed()
+      return
+    }
+    // Not grown to hold the whole waveform (1px for rounding), so it is not what sizes the container. The padding
+    // is taken off, as in render(): clientWidth counts it
+    if (el.clientWidth - this.containerInlinePadding < scrollWidth - 1) return
+
+    // A `contain` of custom code is not ours to replace
+    if (el.style.contain || !this.hasWidthWithoutScrollArea()) return
+    el.style.contain = 'inline-size'
+    this.ownsContainment = true
+    this.releaseIfCollapsed()
+  }
+
+  /** Whether the containment is this renderer's own: applied here, and the declaration still as it was set */
+  private isContained(): boolean {
+    const style = this.scrollContainer.style
+    return this.ownsContainment && style.contain === 'inline-size' && !style.getPropertyPriority('contain')
+  }
+
+  /** Take off the containment this renderer applied, and only that */
+  private releaseContainment() {
+    if (this.isContained()) this.scrollContainer.style.contain = ''
+    this.ownsContainment = false
+  }
+
+  /** A scroll area sized by its content on purpose (`width: max-content`, however written) collapses contained */
+  private releaseIfCollapsed() {
+    const el = this.scrollContainer
+    if (this.isContained() && el.clientWidth <= this.containerInlinePadding && this.isDisplayed()) {
+      this.releaseContainment()
+    }
+  }
+
+  /**
+   * Whether the container takes part in the layout. Nothing in a `display: none` ancestor has a size, which says
+   * nothing of how wide the container is: what was decided for it stands until it is shown again. Asked of the
+   * box, not of the width: a displayed container can be 0 wide.
+   */
+  private isDisplayed(): boolean {
+    return this.container.getClientRects().length > 0
+  }
+
+  /**
+   * Whether the container has a width of its own: its width with the scroll area, and so the waveform and any
+   * padding or border the page gave the scroll area, out of the way.
+   */
+  private hasWidthWithoutScrollArea(): boolean {
+    const el = this.scrollContainer
+    const display = el.style.getPropertyValue('display')
+    const priority = el.style.getPropertyPriority('display')
+    // Important, as a page rule on the exposed `scroll` part would beat a normal declaration. Undone in the same
+    // task, so the focus and scroll position inside survive (Chrome, Firefox and WebKit only drop them from a
+    // scroll area that stays hidden)
+    el.style.setProperty('display', 'none', 'important')
+    const width = this.container.offsetWidth
+    el.style.setProperty('display', display, priority)
+    return width > HOST_MIN_WIDTH
+  }
+
   private initHtml(): [HTMLElement, ShadowRoot] {
     const div = document.createElement('div')
     const shadow = div.attachShadow({ mode: 'open' })
@@ -397,6 +501,14 @@ class Renderer {
       newParent.appendChild(this.container)
 
       this.parent = newParent
+      // What was decided for the old container does not hold here, and the waveform's old width would stretch
+      // this one when measured: decide again, as for a first render. Clearing the wrapper loses no scroll
+      // position, as moving the host has already reset it
+      this.wrapper.style.width = ''
+      this.releaseContainment()
+      // Nor does the padding of the old scroll area: a container as wide as the old one gives the resize observer
+      // nothing to report, so the move is the only time to take it from the new one
+      this.calculateInlinePadding()
     }
 
     if (options.dragToSeek === true || typeof options.dragToSeek === 'object') {
@@ -864,6 +976,7 @@ class Renderer {
 
     // Set additional styles
     this.scrollContainer.style.overflowX = this.isScrollable.value ? 'auto' : 'hidden'
+    this.containScrollWidth(scrollWidth)
     this.scrollContainer.classList.toggle('noScrollbar', !!this.options.hideScrollbar)
     this.cursor.style.backgroundColor = `${this.options.cursorColor || this.options.progressColor}`
     this.cursor.style.width = `${this.options.cursorWidth}px`
