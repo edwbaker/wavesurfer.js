@@ -1,4 +1,5 @@
 import Player from '../player.js'
+import WebAudioPlayer from '../webaudio.js'
 
 class TestPlayer extends Player {
   public setSource(url: string) {
@@ -454,6 +455,75 @@ describe('setTime before metadata', () => {
 
     player.setTime(10)
     expect(player.getCurrentTime()).toBe(5)
+
+    player.destroy()
+  })
+})
+
+describe('setDecodedSrc', () => {
+  const originalCreateObjectURL = URL.createObjectURL
+  const originalRevokeObjectURL = URL.revokeObjectURL
+  const originalFetch = global.fetch
+
+  const createWebAudioPlayer = () => {
+    const audioContext = {
+      destination: {},
+      currentTime: 0,
+      createGain: () => ({ gain: { value: 1 }, connect: jest.fn(), disconnect: jest.fn() }),
+      createBufferSource: jest.fn(),
+      close: jest.fn(() => Promise.resolve()),
+    }
+    return new WebAudioPlayer(audioContext as unknown as AudioContext)
+  }
+
+  beforeEach(() => {
+    URL.createObjectURL = jest.fn(() => 'blob:decoded')
+    URL.revokeObjectURL = jest.fn()
+    global.fetch = jest.fn()
+  })
+
+  afterEach(() => {
+    URL.createObjectURL = originalCreateObjectURL
+    URL.revokeObjectURL = originalRevokeObjectURL
+    global.fetch = originalFetch
+  })
+
+  test('throws for media that is not the WebAudio player', () => {
+    const player = new Player({ media: document.createElement('audio') })
+
+    expect(() => player.setDecodedSrc(new Blob(), {} as AudioBuffer)).toThrow(/WebAudio backend/)
+
+    player.destroy()
+  })
+
+  test('plays the decoded buffer under the blob URL, without fetching or decoding again', () => {
+    const webAudio = createWebAudioPlayer()
+    const loadBuffer = jest.spyOn(webAudio, 'loadBuffer')
+    const player = new Player({ media: webAudio as unknown as HTMLMediaElement })
+    const blob = new Blob()
+    const buffer = {} as AudioBuffer
+
+    player.setDecodedSrc(blob, buffer)
+
+    expect(URL.createObjectURL).toHaveBeenCalledWith(blob)
+    expect(loadBuffer).toHaveBeenCalledWith(buffer, 'blob:decoded')
+    expect(global.fetch).not.toHaveBeenCalled()
+
+    player.destroy()
+  })
+
+  test('revokes the previous blob URL when a new blob is set', () => {
+    URL.createObjectURL = jest.fn().mockReturnValueOnce('blob:first').mockReturnValueOnce('blob:second')
+    const webAudio = createWebAudioPlayer()
+    const loadBuffer = jest.spyOn(webAudio, 'loadBuffer')
+    const player = new Player({ media: webAudio as unknown as HTMLMediaElement })
+    const secondBuffer = {} as AudioBuffer
+
+    player.setDecodedSrc(new Blob(), {} as AudioBuffer)
+    player.setDecodedSrc(new Blob(), secondBuffer)
+
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:first')
+    expect(loadBuffer).toHaveBeenLastCalledWith(secondBuffer, 'blob:second')
 
     player.destroy()
   })

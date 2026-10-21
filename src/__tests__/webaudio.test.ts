@@ -596,3 +596,53 @@ describe('seeking events', () => {
     expect(events).toEqual(['seeking', 'seeked', 'timeupdate'])
   })
 })
+
+describe('loadBuffer', () => {
+  test('plays the buffer it is given, without fetching or decoding a source', () => {
+    const { audioContext } = createMockAudioContext()
+    const player = new WebAudioPlayer(audioContext)
+    global.fetch = jest.fn()
+
+    player.loadBuffer(createMockBuffer(3), 'http://x/a.mp3')
+
+    expect(global.fetch).not.toHaveBeenCalled()
+    expect(audioContext.decodeAudioData).not.toHaveBeenCalled()
+    expect(player.duration).toBe(3)
+    expect(player.src).toBe('http://x/a.mp3')
+  })
+
+  test('emits loadedmetadata, with the duration already set, and then canplay', () => {
+    const { audioContext } = createMockAudioContext()
+    const player = new WebAudioPlayer(audioContext)
+    const events: string[] = []
+    player.on('loadedmetadata', () => events.push(`loadedmetadata:${player.duration}`))
+    player.on('canplay', () => events.push('canplay'))
+
+    player.loadBuffer(createMockBuffer(3), 'http://x/a.mp3')
+
+    expect(events).toEqual(['loadedmetadata:3', 'canplay'])
+  })
+
+  test('drops a fetch still running for the source it replaces', async () => {
+    const { audioContext } = createMockAudioContext()
+    ;(audioContext.decodeAudioData as jest.Mock).mockResolvedValue(createMockBuffer(1))
+    const player = new WebAudioPlayer(audioContext)
+    const onCanplay = jest.fn()
+    player.on('canplay', onCanplay)
+
+    let resolveFetch: (response: Response) => void = () => undefined
+    global.fetch = jest.fn().mockImplementation(() => new Promise<Response>((res) => (resolveFetch = res)))
+    player.src = 'http://x/old.mp3'
+    player.loadBuffer(createMockBuffer(2), 'http://x/new.mp3')
+    onCanplay.mockClear()
+
+    resolveFetch({
+      status: 200,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+    } as unknown as Response)
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(onCanplay).not.toHaveBeenCalled()
+    expect(player.duration).toBe(2)
+  })
+})

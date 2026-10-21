@@ -1,6 +1,8 @@
-/** Decode an array buffer into an audio buffer */
-async function decode(audioData: ArrayBuffer, sampleRate: number): Promise<AudioBuffer> {
-  const audioCtx = new AudioContext({ sampleRate })
+/**
+ * Decode an array buffer into an audio buffer. Without a sample rate the buffer is decoded at the device's rate.
+ */
+async function decode(audioData: ArrayBuffer, sampleRate?: number): Promise<AudioBuffer> {
+  const audioCtx = new AudioContext(sampleRate ? { sampleRate } : undefined)
   try {
     return await audioCtx.decodeAudioData(audioData)
   } finally {
@@ -96,8 +98,29 @@ function createBuffer(channelData: Array<Float32Array | number[]>, duration: num
   } as AudioBuffer
 }
 
+/** Whether a decoded buffer can be resampled with `resample`. Browsers without an OfflineAudioContext can't. */
+function canResample(): boolean {
+  return typeof OfflineAudioContext === 'function'
+}
+
+/**
+ * Resample a decoded buffer to another sample rate. The rendering is a resampling of the samples already decoded,
+ * not a second decode of the file, which is the expensive part of loading.
+ */
+async function resample(buffer: AudioBuffer, sampleRate: number): Promise<AudioBuffer> {
+  const length = Math.max(1, Math.ceil(buffer.duration * sampleRate))
+  const offlineCtx = new OfflineAudioContext({ numberOfChannels: buffer.numberOfChannels, length, sampleRate })
+  const source = offlineCtx.createBufferSource()
+  source.buffer = buffer
+  source.connect(offlineCtx.destination)
+  source.start()
+  return offlineCtx.startRendering()
+}
+
 const Decoder = {
   decode,
+  canResample,
+  resample,
   createBuffer,
 }
 

@@ -190,6 +190,28 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
       })
   }
 
+  /**
+   * Play audio that is already decoded, as the src setter does once it has decoded its source. A load under the
+   * WebAudio backend decodes the file once, and hands the buffer here instead of having the source fetched and
+   * decoded again.
+   */
+  loadBuffer(buffer: AudioBuffer, src: string) {
+    this.currentSrc = src
+    this._duration = undefined
+    this.error = null
+
+    // Drop any fetch/decode still running for an earlier source, as the src setter does
+    this.srcGeneration++
+    this.srcFetchAbort?.abort()
+    this.srcFetchAbort = null
+
+    this.buffer = buffer
+    this.emit('loadedmetadata')
+    this.emit('canplay')
+
+    if (this.autoplay) this.play()
+  }
+
   private _play() {
     if (!this.paused) return
     this.paused = false
