@@ -127,6 +127,83 @@ export function resolveBarYPosition({
   return halfHeight - topHeight
 }
 
+/**
+ * The largest magnitude among samples `start` up to `end`. A missing or NaN
+ * sample counts for nothing, as it did when drawing read `sample || 0`.
+ */
+function maxMagnitude(channel: Float32Array | number[], start: number, end: number): number {
+  let max = 0
+  for (let i = start; i < end; i++) {
+    const value = channel[i]
+    const magnitude = value < 0 ? -value : value
+    if (magnitude > max) max = magnitude
+  }
+  return max
+}
+
+/**
+ * The first sample from `from` up to `length` whose column, `Math.round(index * scale)`, is beyond
+ * `column`; `length + 1` if there is none. Once a sample is beyond a column so is every later one:
+ * a product rounded to the nearest number never decreases as the index grows, and nor does the
+ * rounding of it. So the sample is found by galloping out from `from` and then halving, testing
+ * the very expression the drawing loops tested one sample at a time, instead of estimating by a
+ * division that can overflow, or fail to tell a column from the next. This is exact for any scale,
+ * and it ends, because it only ever narrows a range of whole numbers.
+ */
+function firstSampleBeyondColumn(column: number, scale: number, from: number, length: number): number {
+  const isBeyond = (index: number) => Math.round(index * scale) > column
+  if (from > length || !isBeyond(length)) return length + 1
+
+  // `low` is a sample known not to be beyond the column (the one before `from` is in it), `high`
+  // one known to be: the last, to begin with
+  let low = from - 1
+  let high = from
+  let step = 1
+  while (high < length && !isBeyond(high)) {
+    low = high
+    step *= 2
+    high = Math.min(length, high + step)
+  }
+
+  while (high - low > 1) {
+    const middle = low + Math.floor((high - low) / 2)
+    if (isBeyond(middle)) high = middle
+    else low = middle
+  }
+  return high
+}
+
+/**
+ * Walks the samples of a waveform drawn `scale` columns to a sample, calling
+ * `onRun(column, start, end)` for each run of consecutive samples that share a
+ * column, once the next column has begun, in order. `column` is
+ * `Math.round(start * scale)`. This is the walk the drawing loops made, one
+ * sample at a time -- close the run when `Math.round(i * scale)` passes the
+ * run's column, for `i` up to and including `length` -- found without a
+ * rounding and a comparison per sample: the end of each run is searched for
+ * (see firstSampleBeyondColumn), in steps that grow only with the logarithm of
+ * the run's length, so what is left for each sample is reading it. A caller
+ * that scans the runs reads each sample of them once, so its cost still follows
+ * those samples, not the columns. A run that nothing follows, the last, is not
+ * reported, so a caller does not scan it; its column is returned.
+ */
+export function forEachColumnRun(
+  length: number,
+  scale: number,
+  onRun: (column: number, start: number, end: number) => void,
+): number {
+  let column = 0
+  let start = 0
+
+  for (;;) {
+    const next = firstSampleBeyondColumn(column, scale, start + 1, length)
+    if (next > length) return column
+    onRun(column, start, next)
+    column = Math.round(next * scale)
+    start = next
+  }
+}
+
 export function calculateBarSegments({
   channelData,
   barIndexScale,
@@ -154,48 +231,31 @@ export function calculateBarSegments({
 
   const segments: BarSegment[] = []
 
-  let prevX = 0
-  let maxTop = 0
-  let maxBottom = 0
+  forEachColumnRun(length, barIndexScale, (column, start, end) => {
+    const { topHeight, totalHeight } = calculateBarHeights({
+      maxTop: maxMagnitude(topChannel, start, end),
+      maxBottom: maxMagnitude(bottomChannel, start, end),
+      halfHeight,
+      vScale,
+      barMinHeight,
+      barAlign,
+    })
 
-  for (let i = 0; i <= length; i++) {
-    const x = Math.round(i * barIndexScale)
+    const y = resolveBarYPosition({
+      barAlign,
+      halfHeight,
+      topHeight,
+      totalHeight,
+      canvasHeight,
+    })
 
-    if (x > prevX) {
-      const { topHeight, totalHeight } = calculateBarHeights({
-        maxTop,
-        maxBottom,
-        halfHeight,
-        vScale,
-        barMinHeight,
-        barAlign,
-      })
-
-      const y = resolveBarYPosition({
-        barAlign,
-        halfHeight,
-        topHeight,
-        totalHeight,
-        canvasHeight,
-      })
-
-      segments.push({
-        x: prevX * barSpacing,
-        y,
-        width: barWidth,
-        height: totalHeight,
-      })
-
-      prevX = x
-      maxTop = 0
-      maxBottom = 0
-    }
-
-    const magnitudeTop = Math.abs(topChannel[i] || 0)
-    const magnitudeBottom = Math.abs(bottomChannel[i] || 0)
-    if (magnitudeTop > maxTop) maxTop = magnitudeTop
-    if (magnitudeBottom > maxBottom) maxBottom = magnitudeBottom
-  }
+    segments.push({
+      x: column * barSpacing,
+      y,
+      width: barWidth,
+      height: totalHeight,
+    })
+  })
 
   return segments
 }
@@ -484,25 +544,13 @@ export function calculateLinePaths({
     const direction = index === 0 ? -1 : 1
 
     const path: LinePath = [{ x: 0, y: baseY }]
-    let prevX = 0
-    let max = 0
 
-    for (let i = 0; i <= length; i++) {
-      const x = Math.round(i * hScale)
+    const lastColumn = forEachColumnRun(length, hScale, (column, start, end) => {
+      const heightDelta = Math.round(maxMagnitude(channel, start, end) * halfHeight * vScale) || 1
+      path.push({ x: column, y: baseY + heightDelta * direction })
+    })
 
-      if (x > prevX) {
-        const heightDelta = Math.round(max * halfHeight * vScale) || 1
-        const y = baseY + heightDelta * direction
-        path.push({ x: prevX, y })
-        prevX = x
-        max = 0
-      }
-
-      const value = Math.abs(channel[i] || 0)
-      if (value > max) max = value
-    }
-
-    path.push({ x: prevX, y: baseY })
+    path.push({ x: lastColumn, y: baseY })
 
     return path
   })
