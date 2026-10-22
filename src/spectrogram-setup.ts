@@ -538,6 +538,8 @@ export function spectrogramSetup(
   let lastZoomLevel = 0
   const renderThrottleMs = 50 // Reduced frequency for better performance
   const zoomThreshold = 0.05 // More sensitive zoom detection
+  // The index each canvas was drawn for, so clearExcessCanvases can tell how far from view it is
+  const canvasIndexes = new WeakMap<HTMLCanvasElement, number>()
   let drawnCanvases: Record<number, boolean> = {}
   // The latest draw's canvases, each attached once its bitmaps are drawn (see showPaintedCanvas)
   let canvases: HTMLCanvasElement[] = []
@@ -674,11 +676,34 @@ export function spectrogramSetup(
     }
   }
 
-  function clearExcessCanvases(): void {
-    // Clear canvases to avoid too many DOM nodes
-    if (Object.keys(drawnCanvases).length > MAX_NODES) {
-      clearCanvases()
+  // Makes room for the canvases from startIndex to endIndex, the range about to be drawn: while more
+  // than MAX_NODES canvases would be kept, removes the canvases outside that range, farthest first.
+  // A canvas in the range is never removed, so the canvases in view stay on screen
+  function clearExcessCanvases(startIndex: number, endIndex: number): void {
+    let excess = Object.keys(drawnCanvases).length - MAX_NODES
+    for (let i = startIndex; i <= endIndex; i++) {
+      if (!drawnCanvases[i]) excess++
     }
+    if (excess <= 0) return
+
+    // How many canvases away from the range a canvas is: 0 inside it, and for a canvas with no
+    // index, which is then kept
+    const distance = (canvas: HTMLCanvasElement) => {
+      const index = canvasIndexes.get(canvas)
+      return index === undefined ? 0 : Math.max(0, startIndex - index, index - endIndex)
+    }
+    const removed = canvases
+      .filter((canvas) => distance(canvas) > 0)
+      .sort((a, b) => distance(b) - distance(a))
+      .slice(0, excess)
+    removed.forEach((canvas) => {
+      canvas.remove()
+      // A canvas still being painted must not be put on screen once its bitmaps are drawn
+      paintingCanvases.delete(canvas)
+      // Drawn again once it is back in range
+      delete drawnCanvases[canvasIndexes.get(canvas) as number]
+    })
+    canvases = canvases.filter((canvas) => !removed.includes(canvas))
   }
 
   // Tolerant of a missing wavesurfer/wrapper (`?.` + `|| 0`, not a direct dereference): windowed
@@ -1772,6 +1797,7 @@ export function spectrogramSetup(
       if (canvasWidth <= 0) return
 
       const canvas = createSingleCanvas(canvasWidth, totalHeight, offset)
+      canvasIndexes.set(canvas, canvasIndex)
       canvases.push(canvas)
       paintingCanvases.add(canvas)
       const canvasCtx = canvas.getContext('2d')
@@ -1834,13 +1860,13 @@ export function spectrogramSetup(
         const visibleStart = Math.max(0, scrollLeft - containerWidth * bufferRatio)
         const visibleEnd = Math.min(totalWidth, scrollLeft + containerWidth * (1 + bufferRatio))
 
-        const startCanvasIndex = Math.floor((visibleStart / totalWidth) * numCanvases)
+        // Canvas i starts at i * perCanvasWidth. The last canvas is usually narrower, so scaling by
+        // totalWidth / numCanvases would put the start past a canvas that is still in view
+        const startCanvasIndex = Math.floor(visibleStart / perCanvasWidth)
         const endCanvasIndex = Math.min(Math.ceil((visibleEnd / totalWidth) * numCanvases), numCanvases - 1)
 
-        // Clear excess canvases if we have too many
-        if (Object.keys(drawnCanvases).length > MAX_NODES) {
-          clearExcessCanvases()
-        }
+        // Make room for the canvases about to be drawn, keeping every canvas in their range
+        clearExcessCanvases(startCanvasIndex, endCanvasIndex)
 
         // Draw visible canvases
         for (let i = startCanvasIndex; i <= endCanvasIndex; i++) {
