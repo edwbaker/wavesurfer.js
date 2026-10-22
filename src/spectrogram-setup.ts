@@ -23,7 +23,7 @@ import {
   unitType,
   createWrapperClickHandler,
   AUTO_GAIN_BUFFER_BUDGET_BYTES,
-  paintColumnPixels,
+  createSpectrogramBitmap,
   getCanvasPixelRatio,
 } from './spectrogram-render-utils.js'
 import { computeFrequencies, type FrequencyParams } from './spectrogram-frequencies.js'
@@ -1607,25 +1607,17 @@ export function spectrogramSetup(
 
     if (segmentPixels.length === 0) return
 
-    // Create ImageData for this segment
-    const segmentWidth = segmentPixels.length
-    const imageData = new ImageData(segmentWidth, bitmapHeight)
-    const data = imageData.data
-
-    // Always use quality rendering - users want accurate spectrograms
-    fillImageDataQuality(data, segmentPixels, segmentWidth, bitmapHeight)
-
     // Calculate frequency scaling
     const rMin = hzToScale(freqMin, settings.scale) / hzToScale(freqFrom, settings.scale)
     const rMax = hzToScale(freqMax, settings.scale) / hzToScale(freqFrom, settings.scale)
     const rMax1 = Math.min(1, rMax)
 
-    // Create and draw the bitmap - manage async properly
-    const bitmapPromise = createImageBitmap(
-      imageData,
-      0,
+    // Create and draw the bitmap - manage async properly. Only rows inside the frequency range are painted
+    const bitmapPromise = createSpectrogramBitmap(
+      segmentPixels,
+      bitmapHeight,
+      colorMap,
       Math.round(bitmapHeight * (1 - rMax1)),
-      segmentWidth,
       Math.round(bitmapHeight * (rMax1 - rMin)),
     )
 
@@ -1988,18 +1980,6 @@ export function spectrogramSetup(
 
   function efficientResample(frequenciesData: Uint8Array[][], targetWidth: number): Uint8Array[][] {
     return frequenciesData.map((channelFreq) => resampleChannel(channelFreq, targetWidth))
-  }
-
-  function fillImageDataQuality(
-    data: Uint8ClampedArray,
-    segmentPixels: Uint8Array[],
-    segmentWidth: number,
-    bitmapHeight: number,
-  ): void {
-    // High quality rendering - process all pixels
-    for (let i = 0; i < segmentWidth; i++) {
-      paintColumnPixels(data, segmentPixels[i], colorMap, i, segmentWidth, bitmapHeight)
-    }
   }
 
   // ---- Wire up to wavesurfer (replaces the pre-port onInit()) ----

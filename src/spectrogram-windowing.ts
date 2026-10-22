@@ -17,7 +17,7 @@
  * progressive scheduling unit-testable in isolation (see spectrogram-windowing.test.ts).
  */
 
-import { hzToScale, paintColumnPixels, getCanvasPixelRatio } from './spectrogram-render-utils.js'
+import { hzToScale, createSpectrogramBitmap, getCanvasPixelRatio } from './spectrogram-render-utils.js'
 
 /** One lazily-computed slice of the sliding window's frequency data. */
 export interface FrequencySegment {
@@ -650,13 +650,6 @@ async function renderChannelToCanvas(
   if (channelFreq.length === 0) return
 
   const freqBins = channelFreq[0].length
-  const imageData = new ImageData(channelFreq.length, freqBins)
-  const data = imageData.data
-
-  for (let i = 0; i < channelFreq.length; i++) {
-    paintColumnPixels(data, channelFreq[i], opts.colorMap, i, channelFreq.length, freqBins)
-  }
-
   const rMin = hzToScale(opts.freqMin, opts.scale) / hzToScale(opts.freqFrom, opts.scale)
   const rMax = hzToScale(opts.freqMax, opts.scale) / hzToScale(opts.freqFrom, opts.scale)
   const rMax1 = Math.min(1, rMax)
@@ -666,7 +659,8 @@ async function renderChannelToCanvas(
   const bitmapSourceY = Math.round(freqBins * (1 - rMax1))
   const bitmapSourceHeight = Math.round(freqBins * (rMax1 - rMin))
 
-  const bitmap = await createImageBitmap(imageData, 0, bitmapSourceY, channelFreq.length, bitmapSourceHeight)
+  // Only the rows inside the frequency range are painted
+  const bitmap = await createSpectrogramBitmap(channelFreq, freqBins, opts.colorMap, bitmapSourceY, bitmapSourceHeight)
   canvasCtx.drawImage(bitmap, 0, drawY, width, drawHeight)
   // See spectrogram.ts's identical guard for why 'close' in bitmap is checked rather than assumed.
   if ('close' in bitmap) {
