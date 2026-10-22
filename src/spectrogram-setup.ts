@@ -554,6 +554,8 @@ export function spectrogramSetup(
   const paintingCanvases = new Set<HTMLCanvasElement>()
   // An earlier draw's canvases, kept on screen until all of the latest draw's canvases are painted
   let previousCanvases: HTMLCanvasElement[] = []
+  // The latest draw's readiness, run once its canvases are painted and on screen (see finishReplacement)
+  let pendingReady: (() => void) | null = null
   let scrollUnsubscribe: (() => void) | null = null
 
   // ---- setOptions() state ----
@@ -651,21 +653,27 @@ export function spectrogramSetup(
   }
 
   function clearCanvases(): void {
+    // The cleared draw's lazy drawing must not bring its picture back on the next scroll
+    scrollUnsubscribe?.()
+    scrollUnsubscribe = null
     canvases.forEach((canvas) => canvas.remove())
     previousCanvases.forEach((canvas) => canvas.remove())
     canvases = []
     previousCanvases = []
     paintingCanvases.clear()
     drawnCanvases = {}
+    pendingReady = null
   }
 
   // Starts a new draw's canvases. The canvases on screen stay there until the new ones are
-  // painted, while canvases of a superseded draw that never got on screen are dropped
+  // painted, while canvases of a superseded draw that never got on screen are dropped, and so is
+  // its readiness
   function replaceCanvases(): void {
     previousCanvases.push(...canvases.filter((canvas) => canvas.parentNode))
     canvases = []
     paintingCanvases.clear()
     drawnCanvases = {}
+    pendingReady = null
   }
 
   // Attaches a canvas of the latest draw once its bitmaps are drawn. While an earlier draw's
@@ -674,13 +682,23 @@ export function spectrogramSetup(
   function showPaintedCanvas(canvas: HTMLCanvasElement): void {
     // Dropped by a newer draw, clearCanvases() or destroy()
     if (!paintingCanvases.delete(canvas)) return
-    if (previousCanvases.length === 0) {
-      canvasContainer.appendChild(canvas)
-    } else if (paintingCanvases.size === 0) {
+    if (previousCanvases.length === 0) canvasContainer.appendChild(canvas)
+    finishReplacement()
+  }
+
+  // Once none of the latest draw's canvases is still painting, puts them on screen in place of an
+  // earlier draw's canvases, then reports the draw ready. Also run after a pass of lazy drawing,
+  // whose trimming can leave nothing painting without any canvas finishing
+  function finishReplacement(): void {
+    if (paintingCanvases.size > 0) return
+    if (previousCanvases.length > 0) {
       previousCanvases.forEach((previous) => previous.remove())
       previousCanvases = []
       canvases.forEach((painted) => canvasContainer.appendChild(painted))
     }
+    const ready = pendingReady
+    pendingReady = null
+    ready?.()
   }
 
   // Makes room for the canvases from startIndex to endIndex, the range about to be drawn: while more
@@ -1224,19 +1242,20 @@ export function spectrogramSetup(
     await fetchAndDrawFrequencies(url)
   }
 
-  async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: () => void): Promise<void> {
+  // Resolves to whether the draw reports ready, as drawSpectrogram() returns
+  async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: () => void): Promise<boolean> {
     const resp = await fetch(url)
     if (!resp.ok) {
       throw new Error('Unable to fetch frequencies data')
     }
     const data = await resp.json()
-    if (ctx.scope.disposed) return
+    if (ctx.scope.disposed) return false
     // frequenciesDataUrl's contract (see SpectrogramPluginOptions.frequenciesDataUrl) is that
     // the JSON already IS a Uint8Array[][]-shaped nested array; parsed JSON can only ever
     // produce plain number arrays (never real Uint8Array instances), but every consumer below
     // only relies on indexing/length/iteration, which plain arrays support identically. Not
     // runtime-validated, matching the pre-port behavior.
-    drawSpectrogram(data as Uint8Array[][], beforeReady)
+    return drawSpectrogram(data as Uint8Array[][], beforeReady)
   }
 
   async function getFrequenciesData(): Promise<Uint8Array[][] | null> {
@@ -1567,6 +1586,8 @@ export function spectrogramSetup(
     let version = -1
     let failed = false
     let completed = false
+    // Whether the draw reports ready by itself, once its canvases are on screen
+    let readyPending = false
     const completeBeforeReady = () => {
       completed = true
       completeDraw(drawVersion, generation)
@@ -1574,7 +1595,7 @@ export function spectrogramSetup(
 
     try {
       if (frequenciesDataUrl) {
-        await fetchAndDrawFrequencies(frequenciesDataUrl, completeBeforeReady)
+        readyPending = await fetchAndDrawFrequencies(frequenciesDataUrl, completeBeforeReady)
         if (ctx.scope.disposed) return
         version = drawVersion
       } else {
@@ -1585,7 +1606,7 @@ export function spectrogramSetup(
           if (ctx.scope.disposed || !frequencies || generation !== analysisGeneration) return
           // Draw what this render computed (cache hit, fresh data, or empty on failure)
           // rather than whatever the cache field holds
-          drawSpectrogram(frequencies, completeBeforeReady)
+          readyPending = drawSpectrogram(frequencies, completeBeforeReady)
           version = drawVersion
         }
       }
@@ -1595,8 +1616,9 @@ export function spectrogramSetup(
       failed = true
     } finally {
       isRendering = false
-      // A draw without 'ready' (empty data, zero width) is settled here
-      if (version >= 0 && !failed && !completed) completeDraw(version, generation)
+      // A draw without 'ready' (empty data, zero width) is settled here. A draw still being
+      // painted settles its requests once it is on screen
+      if (version >= 0 && !failed && !completed && !readyPending) completeDraw(version, generation)
       runQueuedRerender()
       redrawIfChanged(version)
     }
@@ -1617,10 +1639,11 @@ export function spectrogramSetup(
     let version = -1
     let failed = false
     let completed = false
+    let readyPending = false
 
     try {
       // Use cached frequencies for fast re-render
-      drawSpectrogram(cachedFrequencies, () => {
+      readyPending = drawSpectrogram(cachedFrequencies, () => {
         completed = true
         completeDraw(drawVersion, generation)
       })
@@ -1631,7 +1654,7 @@ export function spectrogramSetup(
       failed = true
     } finally {
       isRendering = false
-      if (!failed && !completed) completeDraw(version, generation)
+      if (!failed && !completed && !readyPending) completeDraw(version, generation)
       runQueuedRerender()
       redrawIfChanged(version)
     }
@@ -1717,13 +1740,16 @@ export function spectrogramSetup(
   // reachable via loadFrequenciesData's externally-supplied JSON, see
   // SpectrogramPluginOptions.frequenciesDataUrl. Both shapes are duck-type compatible for the
   // emptiness check below (Uint8Array and Uint8Array[] both have a numeric .length).
-  function drawSpectrogram(input: Uint8Array[][] | Uint8Array[], beforeReady?: () => void): void {
+  //
+  // Returns whether the draw reports ready, running beforeReady and emitting 'ready' once its
+  // canvases are painted and on screen; false when there is nothing to draw.
+  function drawSpectrogram(input: Uint8Array[][] | Uint8Array[], beforeReady?: () => void): boolean {
     drawVersion = stateVersion
     if (!input || input.length === 0 || input.every((channel) => !channel || channel.length === 0)) {
       // Nothing to draw (failed computation, or a buffer too short for a single FFT frame):
       // remove any previously drawn canvases so no stale spectrogram stays on screen
       clearCanvases()
-      return
+      return false
     }
     // data is 1ch [sample, freq] format -> to [channel, sample, freq] format. The global
     // (coercing) isNaN on input[0][0] discriminates the two shapes: for the flat shape
@@ -1744,7 +1770,7 @@ export function spectrogramSetup(
     // Nothing to render
     if (totalWidth === 0 || totalHeight === 0) {
       clearCanvases()
-      return
+      return false
     }
 
     // The current canvases stay on screen until this draw's canvases are painted
@@ -1887,6 +1913,9 @@ export function spectrogramSetup(
         for (let i = startCanvasIndex; i <= endCanvasIndex; i++) {
           drawCanvas(i)
         }
+
+        // Trimming may have removed the only canvases still painting
+        finishReplacement()
       }
 
       // Initial render of visible canvases
@@ -1927,10 +1956,17 @@ export function spectrogramSetup(
       )
     }
 
-    // Settle the requests this draw shows before listeners run, so their actions only affect
-    // later requests
-    beforeReady?.()
-    ctx.emit('ready')
+    // Ready once this draw's canvases are painted and on screen, so 'ready' listeners and settled
+    // setOptions() calls see the new picture. A draw superseded or destroyed before then never is
+    pendingReady = () => {
+      if (ctx.scope.disposed) return
+      // Settle the requests this draw shows before listeners run, so their actions only affect
+      // later requests
+      beforeReady?.()
+      ctx.emit('ready')
+    }
+    finishReplacement()
+    return true
   }
 
   function loadLabels(

@@ -346,4 +346,117 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     await deliver()
     expectShown(h, [next])
   })
+
+  it('puts a redraw on screen when trimming removes the only canvas still painting', async () => {
+    jest.useFakeTimers()
+    // 100px canvases and an 800px view: at 400px the view and half its width either side need
+    // canvases 0 to 15
+    const h = createPlugin({ maxCanvasWidth: 100 }, { width: 3000, clientWidth: 800 })
+    h.view.scrollLeft = 400
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    const previous = h.internals.canvases.slice()
+    expect(previous).toHaveLength(16)
+
+    h.internals.drawSpectrogram(makeFrames())
+    const next = h.internals.canvases.slice()
+    // Every new canvas but the last is painted: the earlier picture stays on screen
+    await deliver(held.splice(0).slice(0, -1))
+    expectShown(h, previous)
+
+    // Back at the start only canvases 0 to 11 are needed. Trimming removes 12 to 15, the one still
+    // painting among them, which leaves nothing to wait for
+    h.view.scrollLeft = 0
+    h.emitter.emit('scroll')
+    jest.advanceTimersByTime(16)
+    expectShown(h, next.slice(0, 12))
+  })
+
+  it.each([
+    ['nothing to draw', (h: Harness) => h.internals.drawSpectrogram([])],
+    [
+      'a zero width',
+      (h: Harness) => {
+        h.size.width = 0
+        h.internals.drawSpectrogram(makeFrames())
+      },
+    ],
+  ])('draws nothing on scroll after a redraw with %s clears the picture', async (_, clear) => {
+    jest.useFakeTimers()
+    const h = createPlugin({ maxCanvasWidth: 1000 }, { width: 6000, clientWidth: 600 })
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+
+    // A draw is due in 16 ms when the picture is cleared
+    h.view.scrollLeft = 3000
+    h.emitter.emit('scroll')
+    clear(h)
+    expectShown(h, [])
+    const createImageBitmap = (globalThis as any).createImageBitmap as jest.Mock
+    const requested = createImageBitmap.mock.calls.length
+
+    jest.advanceTimersByTime(16)
+    h.emitter.emit('scroll')
+    jest.advanceTimersByTime(16)
+    await deliver()
+
+    expect(createImageBitmap.mock.calls.length).toBe(requested)
+    expectShown(h, [])
+  })
+
+  it('reports ready once the canvases of a draw are painted and on screen', async () => {
+    const h = createPlugin()
+    const shownAtReady: number[] = []
+    h.plugin.on('ready', () => shownAtReady.push(h.internals.canvasContainer.querySelectorAll('canvas').length))
+    const beforeReady = jest.fn()
+
+    h.internals.drawSpectrogram(makeFrames(), beforeReady)
+    await flush()
+    expect(beforeReady).not.toHaveBeenCalled()
+    expect(shownAtReady).toEqual([])
+
+    await deliver()
+    expect(beforeReady).toHaveBeenCalledTimes(1)
+    expect(shownAtReady).toEqual([1])
+  })
+
+  it('reports ready only for the latest of overlapping draws', async () => {
+    const h = createPlugin()
+    const ready = jest.fn()
+    h.plugin.on('ready', ready)
+    const first = jest.fn()
+    const second = jest.fn()
+
+    h.internals.drawSpectrogram(makeFrames(), first)
+    h.internals.drawSpectrogram(makeFrames(), second)
+    await deliver()
+
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledTimes(1)
+    expect(ready).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles setOptions() once the redraw it asked for is on screen', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    const h = createPlugin({}, { decoded })
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+    const [previous] = h.internals.canvases
+
+    let settled = false
+    const done = h.plugin.setOptions({ height: 300 }).then(() => (settled = true))
+    // A display change redraws from the retained data on the next frame
+    jest.advanceTimersByTime(20)
+    await flush()
+    const [next] = h.internals.canvases
+    expect(next).not.toBe(previous)
+    expect(settled).toBe(false)
+    expectShown(h, [previous])
+
+    await deliver()
+    await done
+    expectShown(h, [next])
+  })
 })
