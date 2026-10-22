@@ -716,10 +716,6 @@ export function spectrogramSetup(
     return ctx.wavesurfer?.getWrapper()?.offsetWidth || 0
   }
 
-  function getWrapperWidth(): number {
-    return ctx.wavesurfer?.getWrapper()?.clientWidth || 0
-  }
-
   // Single source of truth for "should this render split its channels into separate rows":
   // the plugin's own splitChannels option wins when set, otherwise falls back to the
   // wavesurfer instance's own splitChannels option (so a spectrogram matches the waveform it
@@ -1834,14 +1830,19 @@ export function spectrogramSetup(
       Promise.all(channelsDrawn).then(() => showPaintedCanvas(canvas))
     }
 
-    // Store rendering parameters for lazy loading
-    const isScrollable = totalWidth > getWrapperWidth()
+    // Lazy drawing follows the waveform's view. That needs the spectrogram in the waveform's own
+    // wrapper (in a container of its own, nothing scrolls it with the view) and a view narrower than
+    // the spectrogram, where an unknown (0) view width doesn't count. Up to 3 canvases are all drawn
+    const isScrollable =
+      numCanvases > 3 &&
+      wrapper.parentElement === ctx.wavesurfer?.getWrapper() &&
+      totalWidth > (ctx.wavesurfer?.getWidth() || totalWidth)
 
     // Clear previous scroll listener
     scrollUnsubscribe?.()
     scrollUnsubscribe = null
 
-    if (!isScrollable || numCanvases <= 3) {
+    if (!isScrollable) {
       // Draw all canvases if not scrollable or few canvases
       for (let i = 0; i < numCanvases; i++) {
         drawCanvas(i)
@@ -1849,21 +1850,23 @@ export function spectrogramSetup(
     } else {
       // Implement lazy rendering with scroll listener
       const renderVisibleCanvases = () => {
-        const wsWrapper = ctx.wavesurfer?.getWrapper()
-        if (!wsWrapper) return
+        if (!ctx.wavesurfer) return
 
-        const scrollLeft = wsWrapper.scrollLeft || 0
-        const containerWidth = wsWrapper.clientWidth || 0
+        // The view is the waveform's scroll container. getWrapper() is the full-width content
+        // inside it, which never scrolls itself
+        const scrollLeft = ctx.wavesurfer.getScroll() || 0
+        const containerWidth = ctx.wavesurfer.getWidth() || 0
 
         // Calculate visible range with some buffer
         const bufferRatio = 0.5 // Render 50% extra on each side
         const visibleStart = Math.max(0, scrollLeft - containerWidth * bufferRatio)
         const visibleEnd = Math.min(totalWidth, scrollLeft + containerWidth * (1 + bufferRatio))
 
-        // Canvas i starts at i * perCanvasWidth. The last canvas is usually narrower, so scaling by
-        // totalWidth / numCanvases would put the start past a canvas that is still in view
+        // Canvas i covers [i * perCanvasWidth, (i + 1) * perCanvasWidth). The last canvas is usually
+        // narrower, so scaling by totalWidth / numCanvases would put the start past a canvas still in
+        // view, and the end a canvas or two past the range
         const startCanvasIndex = Math.floor(visibleStart / perCanvasWidth)
-        const endCanvasIndex = Math.min(Math.ceil((visibleEnd / totalWidth) * numCanvases), numCanvases - 1)
+        const endCanvasIndex = Math.min(Math.ceil(visibleEnd / perCanvasWidth) - 1, numCanvases - 1)
 
         // Make room for the canvases about to be drawn, keeping every canvas in their range
         clearExcessCanvases(startCanvasIndex, endCanvasIndex)
@@ -1877,20 +1880,24 @@ export function spectrogramSetup(
       // Initial render of visible canvases
       renderVisibleCanvases()
 
-      // Set up scroll listener for lazy loading
-      let cancelScrollTimeout: (() => void) | null = null
+      // Draw as the waveform scrolls, at most once per 16 ms. A scroll event doesn't push back a draw
+      // already due, and the draw reads the scroll position when it runs, so a continuous scroll
+      // (or playback with autoScroll) keeps drawing instead of waiting for the scrolling to stop
+      let cancelScrollRender: (() => void) | null = null
       const onScroll = () => {
-        cancelScrollTimeout?.()
-        cancelScrollTimeout = ctx.scope.timeout(renderVisibleCanvases, 16) // 60fps
+        if (cancelScrollRender) return
+        cancelScrollRender = ctx.scope.timeout(() => {
+          cancelScrollRender = null
+          renderVisibleCanvases()
+        }, 16)
       }
 
-      const wsWrapper = ctx.wavesurfer?.getWrapper()
-      if (wsWrapper) {
-        const removeScrollListener = ctx.scope.listen(wsWrapper, 'scroll', onScroll, { passive: true })
+      if (ctx.wavesurfer) {
+        const removeScrollListener = ctx.scope.add(ctx.wavesurfer.on('scroll', onScroll))
         scrollUnsubscribe = () => {
           removeScrollListener()
-          cancelScrollTimeout?.()
-          cancelScrollTimeout = null
+          cancelScrollRender?.()
+          cancelScrollRender = null
         }
       }
     }

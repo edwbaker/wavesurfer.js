@@ -1,9 +1,9 @@
 import Spectrogram from '../plugins/spectrogram.js'
 import { createFakeWaveSurfer } from './helpers/fake-wavesurfer.js'
 
-// Full rendering draws a long spectrogram lazily: the canvases in view plus half a view on either
-// side. Once more than MAX_NODES canvases would be kept, the ones farthest out of view are removed.
-// jsdom does no layout, so the wavesurfer wrapper's widths and scroll position are stubbed
+// Full rendering draws a long, scrollable spectrogram lazily: the canvases in the waveform's view
+// plus half a view on either side, drawn as the waveform scrolls. Once more than MAX_NODES canvases
+// would be kept, the ones farthest out of view are removed
 const MAX_NODES = 10
 const VIEW_WIDTH = 800
 const CANVAS_WIDTH = 1000
@@ -68,33 +68,59 @@ afterEach(() => {
   ;(globalThis as any).createImageBitmap = originalCreateImageBitmap
 })
 
-function createPlugin({ totalWidth = TOTAL_WIDTH, canvasWidth = CANVAS_WIDTH } = {}) {
-  // The wrapper the plugin reads its sizes, scroll position and scroll events from
+function createPlugin({
+  totalWidth = TOTAL_WIDTH,
+  canvasWidth = CANVAS_WIDTH,
+  viewWidth = VIEW_WIDTH,
+  scroll = 0,
+  options = {} as Record<string, unknown>,
+} = {}) {
+  // As in a page, the wrapper is the full-width content of the waveform's scroll container: its own
+  // scrollLeft stays 0 and it never fires 'scroll'. The view comes from getScroll() and getWidth(),
+  // and its changes from the waveform's 'scroll' event
   const wrapper = document.createElement('div')
-  let scrollLeft = 0
   Object.defineProperty(wrapper, 'offsetWidth', { value: totalWidth })
-  Object.defineProperty(wrapper, 'clientWidth', { value: VIEW_WIDTH })
-  Object.defineProperty(wrapper, 'scrollLeft', { get: () => scrollLeft })
+  Object.defineProperty(wrapper, 'clientWidth', { value: totalWidth })
+  let scrollLeft = scroll
+  const scrollListeners = new Set<() => void>()
 
-  const plugin: any = Spectrogram.create({ maxCanvasWidth: canvasWidth, sampleRate: 8000 })
-  plugin._init(createFakeWaveSurfer({ getWrapper: () => wrapper }))
+  const plugin: any = Spectrogram.create({ maxCanvasWidth: canvasWidth, sampleRate: 8000, ...options })
+  plugin._init(
+    createFakeWaveSurfer({
+      getWrapper: () => wrapper,
+      getScroll: () => scrollLeft,
+      getWidth: () => viewWidth,
+      on: (event: string, listener: () => void) => {
+        if (event !== 'scroll') return () => undefined
+        scrollListeners.add(listener)
+        return () => scrollListeners.delete(listener)
+      },
+    }),
+  )
   plugins.push(plugin)
   const internals = plugin.__spectrogramInternalsForTests()
   const numCanvases = Math.ceil(totalWidth / canvasWidth)
   const indexOf = (canvas: HTMLCanvasElement) => Math.round(parseFloat(canvas.style.left) / canvasWidth)
+  /** Moves the view, as the waveform's scroll container does */
+  const scrollView = (x: number) => {
+    scrollLeft = x
+    scrollListeners.forEach((listener) => listener())
+  }
 
   return {
+    plugin,
     internals,
     numCanvases,
     indexOf,
+    scrollView,
+    scrollListenerCount: () => scrollListeners.size,
     async draw() {
       internals.drawSpectrogram(makeFrequencies())
       await flush()
     },
     /** Scrolls to x, then lets the plugin's 16 ms scroll timer draw */
     async scrollTo(x: number) {
-      scrollLeft = x
-      wrapper.dispatchEvent(new Event('scroll'))
+      scrollView(x)
       jest.advanceTimersByTime(16)
       await flush()
     },
@@ -117,14 +143,13 @@ function createPlugin({ totalWidth = TOTAL_WIDTH, canvasWidth = CANVAS_WIDTH } =
 
 type Harness = ReturnType<typeof createPlugin>
 
+const sorted = (indexes: Iterable<number>) => [...indexes].sort((a, b) => a - b)
+
 /** canvases, drawnCanvases and the DOM all hold the same canvases */
 function expectConsistent(h: Harness): void {
-  const kept = (h.internals.canvases as HTMLCanvasElement[]).map(h.indexOf).sort((a, b) => a - b)
-  const drawn = Object.keys(h.internals.drawnCanvases)
-    .map(Number)
-    .sort((a, b) => a - b)
-  expect(drawn).toEqual(kept)
-  expect([...h.onScreen().keys()].sort((a, b) => a - b)).toEqual(kept)
+  const kept = sorted((h.internals.canvases as HTMLCanvasElement[]).map(h.indexOf))
+  expect(sorted(Object.keys(h.internals.drawnCanvases).map(Number))).toEqual(kept)
+  expect(sorted(h.onScreen().keys())).toEqual(kept)
 }
 
 /**
@@ -169,16 +194,83 @@ function positions(from: number, to: number, step: number): number[] {
 
 const END = TOTAL_WIDTH - VIEW_WIDTH
 
-describe('full-mode spectrogram canvas trimming', () => {
-  it('draws the start lazily, as a scrollable spectrogram with more than 10 canvases', async () => {
+describe('full-mode spectrogram lazy drawing', () => {
+  it('draws only the canvases around the view of a long, zoomed spectrogram', async () => {
     const h = createPlugin()
     await h.draw()
 
     expect(h.numCanvases).toBe(24)
-    expect([...h.onScreen().keys()].sort((a, b) => a - b)).toEqual([0, 1, 2])
+    // The view [0, 800) and half a view after it end inside canvas 1
+    expect(sorted(h.onScreen().keys())).toEqual([0, 1])
     expectConsistent(h)
   })
 
+  it('starts from the scroll position of the waveform', async () => {
+    const h = createPlugin({ scroll: 12345 })
+    await h.draw()
+
+    // [11945, 13545) around the view [12345, 13145)
+    expect(sorted(h.onScreen().keys())).toEqual([11, 12, 13])
+  })
+
+  it('draws as the waveform scrolls', async () => {
+    const h = createPlugin()
+    await h.draw()
+
+    await scrollThrough(h, positions(0, 5000, 250))
+
+    // Drawn on the way, up to the range around the view [5000, 5800), and all kept (no more than 10)
+    expect(sorted(h.onScreen().keys())).toEqual([0, 1, 2, 3, 4, 5, 6])
+  })
+
+  it('keeps drawing while scroll events come faster than every 16 ms', async () => {
+    const h = createPlugin()
+    await h.draw()
+
+    // 100px every 8 ms, as when scrolling continuously on a 120 Hz display. The draw due 16 ms
+    // after a scroll event runs even though more scroll events keep arriving
+    for (let x = 100; x <= 6000; x += 100) {
+      h.scrollView(x)
+      jest.advanceTimersByTime(8)
+      await flush()
+      const onScreen = h.onScreen()
+      for (const index of h.indexesIn(x, x + VIEW_WIDTH)) expect(onScreen.has(index)).toBe(true)
+    }
+  })
+
+  it('draws every canvas when the spectrogram is in a container of its own', async () => {
+    const container = document.createElement('div')
+    const h = createPlugin({ options: { container } })
+    await h.draw()
+    await h.scrollTo(12000)
+
+    expect(h.onScreen().size).toBe(24)
+    expect(h.scrollListenerCount()).toBe(0)
+  })
+
+  it('draws every canvas when the view is as wide as the spectrogram', async () => {
+    const h = createPlugin({ viewWidth: TOTAL_WIDTH })
+    await h.draw()
+
+    expect(h.onScreen().size).toBe(24)
+    expect(h.scrollListenerCount()).toBe(0)
+  })
+
+  it('follows the scroll through one listener, removed on destroy', async () => {
+    const h = createPlugin()
+    await h.draw()
+    expect(h.scrollListenerCount()).toBe(1)
+
+    // A redraw replaces the listener
+    await h.draw()
+    expect(h.scrollListenerCount()).toBe(1)
+
+    h.plugin.destroy()
+    expect(h.scrollListenerCount()).toBe(0)
+  })
+})
+
+describe('full-mode spectrogram canvas trimming', () => {
   it('keeps the canvases in view on screen while scrolling, removing only canvases out of view', async () => {
     const h = createPlugin()
     await h.draw()
@@ -196,7 +288,7 @@ describe('full-mode spectrogram canvas trimming', () => {
     await scrollThrough(h, positions(0, END, 200))
 
     // The range drawn at the end (canvases 21 to 23) and the 7 canvases nearest to it
-    expect([...h.onScreen().keys()].sort((a, b) => a - b)).toEqual([14, 15, 16, 17, 18, 19, 20, 21, 22, 23])
+    expect(sorted(h.onScreen().keys())).toEqual([14, 15, 16, 17, 18, 19, 20, 21, 22, 23])
   })
 
   it('draws removed canvases again when scrolling back', async () => {
@@ -225,12 +317,11 @@ describe('full-mode spectrogram canvas trimming', () => {
   })
 
   it('keeps the whole range drawn around the view when it alone needs more than 10 canvases', async () => {
-    // 100px canvases: the view and half a view on either side span 16 of them, and the range
-    // drawn around that up to 18
+    // 100px canvases: the view and half a view on either side span 16 or 17 of them
     const h = createPlugin({ totalWidth: 30000, canvasWidth: 100 })
     await h.draw()
 
-    const removed = await scrollThrough(h, positions(0, 6000, 50), 18)
+    const removed = await scrollThrough(h, positions(0, 6000, 50), 17)
 
     expect(removed).toBeGreaterThan(0)
   })

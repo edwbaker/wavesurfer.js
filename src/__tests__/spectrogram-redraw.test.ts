@@ -66,15 +66,25 @@ function createPlugin(
   const size = { width }
   Object.defineProperty(wrapper, 'offsetWidth', { get: () => size.width })
   Object.defineProperty(wrapper, 'clientWidth', { value: clientWidth })
+  // The waveform's view, which full rendering's lazy path draws around
+  const view = { scrollLeft: 0 }
 
   const plugin: any = SpectrogramPlugin.create({ scale: 'linear', ...options })
-  plugin._init(createFakeWaveSurfer({ on: emitter.on, getWrapper: () => wrapper, getDecodedData: () => decoded }))
+  plugin._init(
+    createFakeWaveSurfer({
+      on: emitter.on,
+      getWrapper: () => wrapper,
+      getDecodedData: () => decoded,
+      getScroll: () => view.scrollLeft,
+      getWidth: () => clientWidth,
+    }),
+  )
   plugins.push(plugin)
   const internals = plugin.__spectrogramInternalsForTests()
   // The sample rate the drawn frequency range is scaled against
   internals.buffer = createFakeAudioBuffer(new Float32Array(8000))
 
-  return { plugin, internals, emitter, wrapper, size }
+  return { plugin, internals, emitter, wrapper, size, view }
 }
 
 type Harness = ReturnType<typeof createPlugin>
@@ -274,26 +284,24 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     jest.useFakeTimers()
     // 6000px wide in a 600px viewport: six 1000px canvases, each drawn once near the viewport
     const h = createPlugin({ maxCanvasWidth: 1000 }, { width: 6000, clientWidth: 600 })
-    let scrollLeft = 0
-    Object.defineProperty(h.wrapper, 'scrollLeft', { get: () => scrollLeft })
     const scrollTo = (x: number) => {
-      scrollLeft = x
-      h.wrapper.dispatchEvent(new Event('scroll'))
+      h.view.scrollLeft = x
+      h.emitter.emit('scroll')
       jest.advanceTimersByTime(16)
     }
 
     h.internals.drawSpectrogram(makeFrames())
     await deliver()
-    // The viewport and half its width on either side: canvases 0 and 1
+    // The viewport and half its width on either side, 0 to 900px: canvas 0
     const previous = h.internals.canvases.slice()
-    expect(previous).toHaveLength(2)
+    expect(previous).toHaveLength(1)
     expectShown(h, previous)
 
     h.internals.drawSpectrogram(makeFrames())
-    // Scrolled before the new bitmaps arrive: canvases 2 and 3 join the replacement
+    // Scrolled before the new bitmaps arrive, to 1200 to 2400px: canvases 1 and 2 join the replacement
     scrollTo(1500)
     const next = h.internals.canvases.slice()
-    expect(next).toHaveLength(4)
+    expect(next).toHaveLength(3)
     const bitmaps = held.splice(0)
 
     await deliver(bitmaps.slice(0, 2))
@@ -302,16 +310,17 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     await deliver(bitmaps.slice(2))
     expectShown(h, next)
 
-    // Nothing is left to replace: a canvas drawn on scroll is shown as soon as it is painted
+    // Nothing is left to replace: a canvas drawn on scroll is shown as soon as it is painted.
+    // 3200 to 4400px: canvases 3 and 4
     scrollTo(3500)
-    const [fifth, sixth] = h.internals.canvases.slice(4)
-    const [fifthBitmap, sixthBitmap] = held.splice(0)
+    const [fourth, fifth] = h.internals.canvases.slice(3)
+    const [fourthBitmap, fifthBitmap] = held.splice(0)
+
+    await deliver([fourthBitmap])
+    expectShown(h, [...next, fourth])
 
     await deliver([fifthBitmap])
-    expectShown(h, [...next, fifth])
-
-    await deliver([sixthBitmap])
-    expectShown(h, [...next, fifth, sixth])
+    expectShown(h, [...next, fourth, fifth])
   })
 
   it('keeps the picture on screen through the redraw that follows a resize', async () => {
