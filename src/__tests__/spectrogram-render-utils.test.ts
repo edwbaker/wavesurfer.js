@@ -417,3 +417,35 @@ describe('paintColumnPixels floors fractional bin values', () => {
     expect(data[0]).toBe(255)
   })
 })
+
+describe('applySparseFilterBank output buffers', () => {
+  const filterBank = [
+    // lo = -1 has no lower tap, so that tap must contribute nothing rather than a stale value
+    { lo: -1, weightLo: 0.25, weightHi: 0.75, centerHz: 0 },
+    { lo: 1, weightLo: 0.5, weightHi: 0.5, centerHz: 0 },
+  ]
+  const points = Float32Array.from([1, 2, 3, 4])
+
+  it('writes into a supplied buffer and returns that buffer', () => {
+    const out = new Float32Array(2)
+    const result = applySparseFilterBank(points, filterBank, out)
+
+    expect(result).toBe(out)
+    expect(Array.from(result)).toEqual([0.75, 2.5])
+  })
+
+  it('does not keep a value from an earlier frame in a reused buffer', () => {
+    const out = new Float32Array(2).fill(99)
+
+    expect(Array.from(applySparseFilterBank(points, filterBank, out))).toEqual([0.75, 2.5])
+  })
+
+  it('ignores a supplied buffer of the wrong length', () => {
+    const wrong = new Float32Array(5)
+
+    const result = applySparseFilterBank(points, filterBank, wrong)
+
+    expect(result).not.toBe(wrong)
+    expect(Array.from(result)).toEqual([0.75, 2.5])
+  })
+})

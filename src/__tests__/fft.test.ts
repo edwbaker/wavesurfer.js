@@ -181,3 +181,48 @@ describe('FFT accuracy', () => {
     }
   })
 })
+
+describe('FFT output buffers', () => {
+  function makeFrame(length: number, seed: number): Float32Array {
+    const frame = new Float32Array(length)
+    let state = seed
+    for (let i = 0; i < length; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+      frame[i] = (state / 4294967296) * 2 - 1
+    }
+    return frame
+  }
+
+  it('writes into a supplied buffer and returns that buffer', () => {
+    const fft = new (FFT as any)(64, 16000, 'hann', undefined)
+    const frame = makeFrame(64, 3)
+    const fresh = Array.from(fft.calculateSpectrum(frame))
+
+    const out = new Float32Array(32)
+    const result = fft.calculateSpectrum(frame, out)
+
+    expect(result).toBe(out)
+    expect(Array.from(result)).toEqual(fresh)
+  })
+
+  it('does not carry values from an earlier frame into a reused buffer', () => {
+    const fft = new (FFT as any)(64, 16000, 'hann', undefined)
+    const out = new Float32Array(32)
+    fft.calculateSpectrum(makeFrame(64, 1), out)
+
+    const second = makeFrame(64, 2)
+    const expected = Array.from(new (FFT as any)(64, 16000, 'hann', undefined).calculateSpectrum(second))
+
+    expect(Array.from(fft.calculateSpectrum(second, out))).toEqual(expected)
+  })
+
+  it('ignores a supplied buffer of the wrong length', () => {
+    const fft = new (FFT as any)(64, 16000, 'hann', undefined)
+    const wrong = new Float32Array(7)
+
+    const result = fft.calculateSpectrum(makeFrame(64, 4), wrong)
+
+    expect(result).not.toBe(wrong)
+    expect(result.length).toBe(32)
+  })
+})

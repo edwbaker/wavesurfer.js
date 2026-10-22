@@ -147,14 +147,21 @@ function createSparseFilterBank(
   return filterBank
 }
 
-export function applySparseFilterBank(fftPoints: Float32Array, filterBank: SparseFilter[]): Float32Array {
+/**
+ * Apply a sparse filter bank to one frame of FFT magnitudes. Pass `out` to reuse a buffer across
+ * frames when the result is consumed before the next call; every entry is overwritten.
+ */
+export function applySparseFilterBank(
+  fftPoints: Float32Array,
+  filterBank: SparseFilter[],
+  out?: Float32Array,
+): Float32Array {
   const numFilters = filterBank.length
-  const logSpectrum = new Float32Array(numFilters)
+  const logSpectrum = out && out.length === numFilters ? out : new Float32Array(numFilters)
   for (let i = 0; i < numFilters; i++) {
     const { lo, weightLo, weightHi } = filterBank[i]
-    if (lo >= 0 && lo < fftPoints.length) {
-      logSpectrum[i] = fftPoints[lo] * weightLo
-    }
+    // Assigned rather than accumulated into, so a reused buffer never keeps an earlier frame's value
+    logSpectrum[i] = lo >= 0 && lo < fftPoints.length ? fftPoints[lo] * weightLo : 0
     if (lo + 1 >= 0 && lo + 1 < fftPoints.length) {
       logSpectrum[i] += fftPoints[lo + 1] * weightHi
     }

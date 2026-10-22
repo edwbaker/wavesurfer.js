@@ -627,3 +627,21 @@ describe('noverlap contract (hop size)', () => {
     expect(noOverlap[0].length).toBeLessThan(unset[0].length)
   })
 })
+
+describe('computeFrequencies frame ownership', () => {
+  it('returns a separate buffer for every frame, so frames never alias the per-call scratch', () => {
+    const signal = Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i * 0.1))
+    const params: FrequencyParams = {
+      fftSamples: 512,
+      windowFunc: 'hann',
+      noverlap: 256,
+      scale: 'mel',
+      sampleRate: 16000,
+    }
+
+    const [frames] = computeFrequencies([signal], params)
+
+    expect(frames.length).toBeGreaterThan(1)
+    expect(new Set(frames.map((frame) => frame.buffer)).size).toBe(frames.length)
+  })
+})

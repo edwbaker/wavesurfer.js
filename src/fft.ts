@@ -144,7 +144,9 @@ function FFT(bufferSize: number, sampleRate: number, windowFunc: string, alpha: 
     this.unpackSin[i] = Math.sin((-2 * Math.PI * i) / bufferSize)
   }
 
-  this.calculateSpectrum = function (buffer: Float32Array): Float32Array {
+  // Writes the spectrum into `out` when a buffer of the right length is supplied. Every entry is
+  // overwritten, so the buffer's earlier contents never reach the result
+  this.calculateSpectrum = function (buffer: Float32Array, out?: Float32Array): Float32Array {
     const bufferSize = this.bufferSize,
       halfLength = bufferSize / 2,
       reverseTable = this.reverseTable,
@@ -157,7 +159,7 @@ function FFT(bufferSize: number, sampleRate: number, windowFunc: string, alpha: 
       imag = this.imag,
       bSi = 2 / this.bufferSize,
       sqrt = Math.sqrt,
-      spectrum = new Float32Array(halfLength)
+      spectrum = out && out.length === halfLength ? out : new Float32Array(halfLength)
 
     let rval, ival, mag
 
@@ -231,7 +233,7 @@ export declare class FFT {
   constructor(bufferSize: number, sampleRate: number, windowFunc: string, alpha: number, windowLength?: number)
   bufferSize: number
   windowLength: number
-  calculateSpectrum(buffer: Float32Array): Float32Array
+  calculateSpectrum(buffer: Float32Array, out?: Float32Array): Float32Array
 }
 
 // Export the FFT constructor function
