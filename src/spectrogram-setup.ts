@@ -1137,9 +1137,12 @@ export function spectrogramSetup(
       )
     : null
 
+  // Draw the view as the waveform scrolls or plays, at most once per 16 ms. An event doesn't push back
+  // a draw already due, and the draw reads the view when it runs, so events less than 16 ms apart (a
+  // continuous scroll, or playback with autoScroll) keep drawing instead of waiting for them to stop
   let cancelWindowedRenderTimer: (() => void) | null = null
   function scheduleWindowedRender(): void {
-    cancelWindowedRenderTimer?.()
+    if (cancelWindowedRenderTimer) return
     cancelWindowedRenderTimer = ctx.scope.timeout(() => {
       cancelWindowedRenderTimer = null
       // Fire-and-forget from a timer callback - nothing here awaits this promise, so a
@@ -1149,6 +1152,8 @@ export function spectrogramSetup(
     }, 16) // 60fps
   }
 
+  // Unlike the draw above, a debounce: only zoom changes re-arm it, and the refresh waits for the zoom
+  // to settle
   let cancelQualityUpdateTimer: (() => void) | null = null
   function scheduleQualityUpdate(): void {
     cancelQualityUpdateTimer?.()
