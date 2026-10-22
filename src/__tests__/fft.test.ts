@@ -126,3 +126,58 @@ describe('lanczoz window', () => {
     }
   })
 })
+
+describe('FFT accuracy', () => {
+  // Direct O(N^2) DFT of the windowed frame, scaled like calculateSpectrum()
+  function directSpectrum(frame: Float32Array, windowValues: Float32Array): number[] {
+    const n = frame.length
+    const magnitudes: number[] = []
+    for (let k = 0; k < n / 2; k++) {
+      let re = 0
+      let im = 0
+      for (let t = 0; t < n; t++) {
+        const angle = (-2 * Math.PI * k * t) / n
+        const x = frame[t] * windowValues[t]
+        re += x * Math.cos(angle)
+        im += x * Math.sin(angle)
+      }
+      magnitudes.push((2 / n) * Math.hypot(re, im))
+    }
+    return magnitudes
+  }
+
+  function pseudoRandomFrame(length: number): Float32Array {
+    const frame = new Float32Array(length)
+    let state = 7
+    for (let i = 0; i < length; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+      frame[i] = (state / 4294967296) * 2 - 1
+    }
+    return frame
+  }
+
+  for (const size of [2, 4, 8, 64, 256]) {
+    it(`matches a direct DFT for a ${size}-point transform`, () => {
+      const frame = pseudoRandomFrame(size)
+      const fft = new (FFT as any)(size, 16000, 'hann', undefined)
+      const spectrum = fft.calculateSpectrum(frame)
+      const expected = directSpectrum(frame, fft.windowValues)
+
+      expect(spectrum.length).toBe(size / 2)
+      for (let k = 0; k < size / 2; k++) {
+        expect(Math.abs(spectrum[k] - expected[k])).toBeLessThan(1e-5)
+      }
+    })
+  }
+
+  it('matches a direct DFT for a zero-padded window', () => {
+    const frame = pseudoRandomFrame(64)
+    const fft = new (FFT as any)(64, 16000, 'blackman', undefined, 40)
+    const spectrum = fft.calculateSpectrum(frame)
+    const expected = directSpectrum(frame, fft.windowValues)
+
+    for (let k = 0; k < 32; k++) {
+      expect(Math.abs(spectrum[k] - expected[k])).toBeLessThan(1e-5)
+    }
+  })
+})
