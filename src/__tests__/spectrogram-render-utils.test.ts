@@ -17,6 +17,8 @@ import {
   createColorLookup,
   paintSpectrogramRows,
   createSpectrogramBitmap,
+  getCanvasPixelRatio,
+  getDefaultMaxCanvasWidth,
 } from '../spectrogram-render-utils.js'
 
 const SCALES = ['mel', 'logarithmic', 'bark', 'erb'] as const
@@ -676,5 +678,41 @@ describe('createSpectrogramBitmap', () => {
       const [, , , , height] = createImageBitmapMock.mock.calls[0] as BitmapCall
       expect(height).toBe(0)
     }
+  })
+})
+
+describe('getDefaultMaxCanvasWidth', () => {
+  const originalDpr = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio')
+  const setPixelRatio = (value: number) =>
+    Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true })
+
+  afterEach(() => {
+    if (originalDpr) {
+      Object.defineProperty(window, 'devicePixelRatio', originalDpr)
+    } else {
+      delete (window as any).devicePixelRatio
+    }
+  })
+
+  it('is 4,096 px up to a pixel ratio of 2, and above that keeps the backing store within 8,192 px', () => {
+    for (const [pixelRatio, width] of [
+      [0.5, 4096],
+      [1, 4096],
+      [1.5, 4096],
+      [2, 4096],
+      [2.25, 3640],
+      [3, 2730],
+      [4, 2048],
+    ]) {
+      setPixelRatio(pixelRatio)
+      expect(getDefaultMaxCanvasWidth()).toBe(width)
+      // The backing store createSingleCanvas makes for a canvas that wide, 200 px tall
+      expect(Math.round(width * getCanvasPixelRatio(width, 200))).toBeLessThanOrEqual(8192)
+    }
+  })
+
+  it('treats a missing pixel ratio as 1', () => {
+    setPixelRatio(0)
+    expect(getDefaultMaxCanvasWidth()).toBe(4096)
   })
 })

@@ -794,6 +794,27 @@ export function getCanvasPixelRatio(cssWidth: number, cssHeight: number): number
   )
 }
 
+// The widest canvas backing store every major browser still draws on the GPU: Firefox's limit
+// (gfx.canvas.accelerated.max-size) and iOS Safari's (its IOSurface limit) are both 8,192 px.
+// Chromium's is the GPU's maximum texture size, typically 16,384 px on desktops.
+const GPU_CANVAS_MAX_SIDE = 8192
+// Also under the widest image Firefox draws on the GPU (gfx.canvas.accelerated.max-surface-size,
+// 5,280 px): each full-mode canvas draws one bitmap as wide as its CSS width
+const DEFAULT_MAX_CANVAS_WIDTH = 4096
+
+/**
+ * Default maxCanvasWidth for full-mode canvases, in CSS pixels: 4,096, and at most 8,192 divided
+ * by the device pixel ratio, so the backing store (see getCanvasPixelRatio) stays within 8,192 px.
+ * Above their GPU limit, browsers draw a canvas on the CPU, which is slower and filters a scaled
+ * bitmap differently, so a canvas past the limit would look slightly different from its
+ * neighbors. Narrow canvases also keep each canvas that lazy drawing paints as it scrolls into
+ * view a short task.
+ */
+export function getDefaultMaxCanvasWidth(): number {
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+  return Math.max(1, Math.min(DEFAULT_MAX_CANVAS_WIDTH, Math.floor(GPU_CANVAS_MAX_SIDE / dpr)))
+}
+
 /**
  * Format frequency value for display
  */

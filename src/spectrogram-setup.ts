@@ -25,6 +25,7 @@ import {
   AUTO_GAIN_BUFFER_BUDGET_BYTES,
   createSpectrogramBitmap,
   getCanvasPixelRatio,
+  getDefaultMaxCanvasWidth,
 } from './spectrogram-render-utils.js'
 import { computeFrequencies, type FrequencyParams } from './spectrogram-frequencies.js'
 // Windowed rendering strategy: segment map, eviction, uncovered-range
@@ -200,7 +201,11 @@ export type SpectrogramPluginOptions = {
    * feed. See loadFrequenciesData's own doc comment for the same rationale.
    **/
   frequenciesDataUrl?: string
-  /** Maximum width of individual canvas elements in pixels (default: 30000) */
+  /**
+   * Maximum width of individual canvas elements in pixels. 'full' mode only. (default: 4096, or
+   * 8192 / devicePixelRatio when that is smaller, which keeps every canvas within the size
+   * browsers draw on the GPU)
+   */
   maxCanvasWidth?: number
   /** Use web worker for FFT calculations (default: false) */
   useWebWorker?: boolean
@@ -519,7 +524,9 @@ export function spectrogramSetup(
   // __spectrogramInternalsForTests().autoGainBudgetBytes).
   let autoGainBudgetBytes = AUTO_GAIN_BUFFER_BUDGET_BYTES
 
-  const maxCanvasWidth = options.maxCanvasWidth || 30000
+  // An explicit maxCanvasWidth, or the default for the current pixel ratio, read at each draw
+  const explicitMaxCanvasWidth = options.maxCanvasWidth || 0
+  const getMaxCanvasWidth = () => explicitMaxCanvasWidth || getDefaultMaxCanvasWidth()
 
   // ---- Mutable render/cache/worker state (closure-owned, replaces the pre-port instance fields) ----
   let buffer: AudioBuffer | null = null
@@ -1727,7 +1734,7 @@ export function spectrogramSetup(
     wrapper.style.height = totalHeight + 'px'
 
     const totalWidth = getWidth()
-    const perCanvasWidth = Math.min(maxCanvasWidth, totalWidth)
+    const perCanvasWidth = Math.min(getMaxCanvasWidth(), totalWidth)
 
     // Nothing to render
     if (totalWidth === 0 || totalHeight === 0) {
@@ -2190,7 +2197,7 @@ export function spectrogramSetup(
       return drawnCanvases
     },
     get maxCanvasWidth() {
-      return maxCanvasWidth
+      return getMaxCanvasWidth()
     },
     get autoGainBudgetBytes() {
       return autoGainBudgetBytes

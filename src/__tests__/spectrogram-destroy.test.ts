@@ -37,7 +37,8 @@ describe('SpectrogramPlugin destroy', () => {
     const b = SpectrogramPlugin.create({})
     b._init(createFakeWaveSurfer())
     expect(a.__spectrogramInternalsForTests().maxCanvasWidth).toBe(1000)
-    expect(b.__spectrogramInternalsForTests().maxCanvasWidth).toBe(30000)
+    // The default at a pixel ratio of 1
+    expect(b.__spectrogramInternalsForTests().maxCanvasWidth).toBe(4096)
   })
 
   describe('async continuations after destroy', () => {

@@ -353,3 +353,45 @@ describe('full-mode spectrogram canvas trimming', () => {
     expectConsistent(h)
   })
 })
+
+describe('full-mode spectrogram default canvas width', () => {
+  const originalDpr = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio')
+
+  afterEach(() => {
+    if (originalDpr) {
+      Object.defineProperty(window, 'devicePixelRatio', originalDpr)
+    } else {
+      delete (window as any).devicePixelRatio
+    }
+  })
+
+  it('splits a long spectrogram into 4,096 px canvases and draws only those around the view', async () => {
+    // With the old 30,000 px default this was 2 canvases, too few for lazy drawing, so both drawn
+    const h = createPlugin({ totalWidth: 40000, canvasWidth: 4096, options: { maxCanvasWidth: undefined } })
+    await h.draw()
+
+    expect(h.internals.maxCanvasWidth).toBe(4096)
+    expect(h.numCanvases).toBe(10)
+    expect(sorted(h.onScreen().keys())).toEqual([0])
+    expect(h.onScreen().get(0)?.style.width).toBe('4096px')
+  })
+
+  it('keeps the canvas backing store within 8,192 px at a pixel ratio of 3', async () => {
+    Object.defineProperty(window, 'devicePixelRatio', { value: 3, configurable: true })
+    const h = createPlugin({ totalWidth: 40000, canvasWidth: 2730, options: { maxCanvasWidth: undefined } })
+    await h.draw()
+
+    const canvas = h.onScreen().get(0) as HTMLCanvasElement
+    expect(canvas.style.width).toBe('2730px')
+    expect(canvas.width).toBe(8190)
+  })
+
+  it('keeps an explicit maxCanvasWidth', async () => {
+    const h = createPlugin({ totalWidth: 40000, canvasWidth: 30000 })
+    await h.draw()
+
+    expect(h.internals.maxCanvasWidth).toBe(30000)
+    // 30,000 and 10,000 px: too few canvases for lazy drawing, so both are drawn
+    expect(sorted(h.onScreen().keys())).toEqual([0, 1])
+  })
+})
