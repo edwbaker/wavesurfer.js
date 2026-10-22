@@ -420,7 +420,7 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     expect(shownAtReady).toEqual([1])
   })
 
-  it('reports ready only for the latest of overlapping draws', async () => {
+  it('reports ready once for overlapping draws, and settles the replaced one with the latest', async () => {
     const h = createPlugin()
     const ready = jest.fn()
     h.plugin.on('ready', ready)
@@ -429,10 +429,13 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
 
     h.internals.drawSpectrogram(makeFrames(), first)
     h.internals.drawSpectrogram(makeFrames(), second)
-    await deliver()
-
+    await flush()
     expect(first).not.toHaveBeenCalled()
+
+    await deliver()
+    expect(first).toHaveBeenCalledTimes(1)
     expect(second).toHaveBeenCalledTimes(1)
+    expect(first.mock.invocationCallOrder[0]).toBeLessThan(second.mock.invocationCallOrder[0])
     expect(ready).toHaveBeenCalledTimes(1)
   })
 
@@ -490,5 +493,39 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     await deliver()
     await done
     expectShown(h, [next])
+  })
+
+  it('settles a setOptions() redraw that a frequency-data load replaces before it is painted', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    const h = createPlugin({}, { decoded })
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+
+    let settled = false
+    const done = h.plugin.setOptions({ height: 300 }).then(() => (settled = true))
+    // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
+    // The options redraw starts on the next frame, and its bitmaps are still being drawn
+    jest.advanceTimersByTime(20)
+    await flush()
+    expect(held.length).toBeGreaterThan(0)
+
+    // A load of frequency data finishes first, and its draw replaces that redraw
+    const originalFetch = (globalThis as any).fetch
+    ;(globalThis as any).fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => makeFrames() })
+    try {
+      await h.plugin.loadFrequenciesData('frequencies.json')
+    } finally {
+      ;(globalThis as any).fetch = originalFetch
+    }
+    const [loaded] = h.internals.canvases
+    expect(settled).toBe(false)
+
+    await deliver()
+    expectShown(h, [loaded])
+    expect(settled).toBe(true)
+    await done
   })
 })

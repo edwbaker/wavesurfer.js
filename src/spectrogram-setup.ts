@@ -556,6 +556,9 @@ export function spectrogramSetup(
   let previousCanvases: HTMLCanvasElement[] = []
   // The latest draw's readiness, run once its canvases are painted and on screen (see finishReplacement)
   let pendingReady: (() => void) | null = null
+  // The request completions of the latest draw and of the draws it replaced before they were
+  // painted, run in order once it is on screen (see drawSpectrogram)
+  let pendingCompletions: Array<() => void> = []
   let scrollUnsubscribe: (() => void) | null = null
 
   // ---- setOptions() state ----
@@ -663,11 +666,13 @@ export function spectrogramSetup(
     paintingCanvases.clear()
     drawnCanvases = {}
     pendingReady = null
+    // A draw with nothing to show runs these first; destroy() has rejected what they wait for
+    pendingCompletions = []
   }
 
   // Starts a new draw's canvases. The canvases on screen stay there until the new ones are
   // painted, while canvases of a superseded draw that never got on screen are dropped, and so is
-  // its readiness
+  // its readiness. Its request completion waits for the draw that replaces it
   function replaceCanvases(): void {
     previousCanvases.push(...canvases.filter((canvas) => canvas.parentNode))
     canvases = []
@@ -699,6 +704,13 @@ export function spectrogramSetup(
     const ready = pendingReady
     pendingReady = null
     ready?.()
+  }
+
+  // Runs the request completions waiting for the latest draw, in the order of their draws
+  function runPendingCompletions(): void {
+    const completions = pendingCompletions
+    pendingCompletions = []
+    completions.forEach((complete) => complete())
   }
 
   // Makes room for the canvases from startIndex to endIndex, the range about to be drawn: while more
@@ -1243,7 +1255,7 @@ export function spectrogramSetup(
   }
 
   // Resolves to whether the draw reports ready, as drawSpectrogram() returns
-  async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: () => void): Promise<boolean> {
+  async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: (version: number) => void): Promise<boolean> {
     const resp = await fetch(url)
     if (!resp.ok) {
       throw new Error('Unable to fetch frequencies data')
@@ -1588,9 +1600,9 @@ export function spectrogramSetup(
     let completed = false
     // Whether the draw reports ready by itself, once its canvases are on screen
     let readyPending = false
-    const completeBeforeReady = () => {
+    const completeBeforeReady = (drawn: number) => {
       completed = true
-      completeDraw(drawVersion, generation)
+      completeDraw(drawn, generation)
     }
 
     try {
@@ -1643,9 +1655,9 @@ export function spectrogramSetup(
 
     try {
       // Use cached frequencies for fast re-render
-      readyPending = drawSpectrogram(cachedFrequencies, () => {
+      readyPending = drawSpectrogram(cachedFrequencies, (drawn) => {
         completed = true
-        completeDraw(drawVersion, generation)
+        completeDraw(drawn, generation)
       })
       version = drawVersion
       lastZoomLevel = ctx.wavesurfer?.options.minPxPerSec || 0
@@ -1741,13 +1753,16 @@ export function spectrogramSetup(
   // SpectrogramPluginOptions.frequenciesDataUrl. Both shapes are duck-type compatible for the
   // emptiness check below (Uint8Array and Uint8Array[] both have a numeric .length).
   //
-  // Returns whether the draw reports ready, running beforeReady and emitting 'ready' once its
-  // canvases are painted and on screen; false when there is nothing to draw.
-  function drawSpectrogram(input: Uint8Array[][] | Uint8Array[], beforeReady?: () => void): boolean {
+  // Returns whether the draw reports ready, running beforeReady with the state version it read and
+  // emitting 'ready' once its canvases are painted and on screen; false when there is nothing to draw.
+  function drawSpectrogram(input: Uint8Array[][] | Uint8Array[], beforeReady?: (version: number) => void): boolean {
     drawVersion = stateVersion
+    const version = drawVersion
     if (!input || input.length === 0 || input.every((channel) => !channel || channel.length === 0)) {
       // Nothing to draw (failed computation, or a buffer too short for a single FFT frame):
-      // remove any previously drawn canvases so no stale spectrogram stays on screen
+      // remove any previously drawn canvases so no stale spectrogram stays on screen. The draws
+      // this one replaced before they were painted are settled now
+      runPendingCompletions()
       clearCanvases()
       return false
     }
@@ -1769,6 +1784,7 @@ export function spectrogramSetup(
 
     // Nothing to render
     if (totalWidth === 0 || totalHeight === 0) {
+      runPendingCompletions()
       clearCanvases()
       return false
     }
@@ -1957,13 +1973,14 @@ export function spectrogramSetup(
     }
 
     // Ready once this draw's canvases are painted and on screen, so 'ready' listeners and settled
-    // setOptions() calls see the new picture. A draw superseded or destroyed before then never is
-    const version = drawVersion
+    // setOptions() calls see the new picture. A draw superseded before then never reports ready,
+    // but what it was to settle is settled with this one, which shows that state or a later one
+    if (beforeReady) pendingCompletions.push(() => beforeReady(version))
     pendingReady = () => {
       if (ctx.scope.disposed) return
       // Settle the requests this draw shows before listeners run, so their actions only affect
       // later requests
-      beforeReady?.()
+      runPendingCompletions()
       ctx.emit('ready')
       // A display change made while this draw was painting waited for it, as did any made by a
       // 'ready' listener: either gets a draw of its own now
