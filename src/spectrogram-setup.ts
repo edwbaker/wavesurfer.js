@@ -1958,12 +1958,16 @@ export function spectrogramSetup(
 
     // Ready once this draw's canvases are painted and on screen, so 'ready' listeners and settled
     // setOptions() calls see the new picture. A draw superseded or destroyed before then never is
+    const version = drawVersion
     pendingReady = () => {
       if (ctx.scope.disposed) return
       // Settle the requests this draw shows before listeners run, so their actions only affect
       // later requests
       beforeReady?.()
       ctx.emit('ready')
+      // A display change made while this draw was painting waited for it, as did any made by a
+      // 'ready' listener: either gets a draw of its own now
+      redrawIfChanged(version)
     }
     finishReplacement()
     return true

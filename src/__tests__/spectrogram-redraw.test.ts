@@ -447,6 +447,8 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
 
     let settled = false
     const done = h.plugin.setOptions({ height: 300 }).then(() => (settled = true))
+    // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
     // A display change redraws from the retained data on the next frame
     jest.advanceTimersByTime(20)
     await flush()
@@ -454,6 +456,36 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     expect(next).not.toBe(previous)
     expect(settled).toBe(false)
     expectShown(h, [previous])
+
+    await deliver()
+    await done
+    expectShown(h, [next])
+  })
+
+  it('draws a display change made while the first draw is still being painted', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    const h = createPlugin({}, { decoded })
+    // The initial render has finished; its bitmaps are still being drawn
+    jest.advanceTimersByTime(50)
+    await flush()
+    expect(held.length).toBeGreaterThan(0)
+    const [first] = h.internals.canvases
+
+    let settled = false
+    const done = h.plugin.setOptions({ height: 300 }).then(() => (settled = true))
+    // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
+    await deliver()
+    expectShown(h, [first])
+
+    // Once the first picture is on screen, the change is drawn on the next frame
+    jest.advanceTimersByTime(20)
+    await flush()
+    const [next] = h.internals.canvases
+    expect(next).not.toBe(first)
+    expect(next.style.height).toBe('300px')
+    expect(settled).toBe(false)
 
     await deliver()
     await done
