@@ -83,6 +83,9 @@ const MinimapPlugin = definePlugin<MinimapPluginOptions, MinimapPluginEvents, ob
       },
     })
 
+    // No transition: the overlay follows the view, which scrolls every frame
+    // during auto-centred playback, so a transition would restart each frame
+    // and trail behind the view.
     const overlay = createElement(
       'div',
       {
@@ -93,7 +96,6 @@ const MinimapPlugin = definePlugin<MinimapPluginOptions, MinimapPluginEvents, ob
           left: '0',
           top: '0',
           bottom: '0',
-          transition: 'left 100ms ease-out, width 100ms ease-out',
           pointerEvents: 'none',
           backgroundColor: opts.overlayColor,
         },
@@ -170,6 +172,27 @@ const MinimapPlugin = definePlugin<MinimapPluginOptions, MinimapPluginEvents, ob
       }, debounceTime)
     }
 
+    // The overlay is moved with a transform rather than `left`, so following
+    // the view doesn't lay it out. The offset is in pixels: a translate
+    // percentage is of the overlay's own width, which layout rounds, and
+    // scaled up to the offset that rounding is pixels of error on a narrow
+    // overlay. So the minimap's width is cached here rather than read on every
+    // scroll.
+    let minimapWidth = 0
+    // Where the overlay starts, as a fraction of the minimap's width
+    let overlayStart = 0
+
+    function positionOverlay() {
+      overlay.style.transform = `translateX(${overlayStart * minimapWidth}px)`
+    }
+
+    if (typeof ResizeObserver === 'function') {
+      ctx.scope.createResizeObserver(minimapWrapper, () => {
+        minimapWidth = minimapWrapper.clientWidth
+        positionOverlay()
+      })
+    }
+
     function updateOverlay(startTime?: number, endTime?: number) {
       const duration = ctx.wavesurfer.getDuration()
       if (!duration) return
@@ -188,7 +211,8 @@ const MinimapPlugin = definePlugin<MinimapPluginOptions, MinimapPluginEvents, ob
       const overlayLeft = (clampedStartTime / duration) * 100
       const overlayWidth = ((clampedEndTime - clampedStartTime) / duration) * 100
 
-      overlay.style.left = `${overlayLeft}%`
+      overlayStart = clampedStartTime / duration
+      positionOverlay()
       overlay.style.width = `${Math.min(overlayWidth, 100 - overlayLeft)}%`
     }
 

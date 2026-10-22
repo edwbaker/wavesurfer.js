@@ -71,6 +71,32 @@ const createMainWaveSurfer = (dragToSeek: boolean | { debounceTime: number } = t
 
 const createMock = WaveSurfer.create as jest.Mock
 
+// jsdom has no ResizeObserver. This one lets a test report the minimap's
+// width, as a real one would after layout.
+const resizeObservers: Array<{ callback: () => void; disconnect: jest.Mock }> = []
+
+class FakeResizeObserver {
+  disconnect = jest.fn()
+  constructor(callback: () => void) {
+    resizeObservers.push({ callback, disconnect: this.disconnect })
+  }
+  observe() {}
+  unobserve() {}
+}
+
+const resizeMinimap = (minimapContainer: HTMLElement, width: number) => {
+  const clientWidth = jest.fn(() => width)
+  Object.defineProperty(minimapContainer, 'clientWidth', { configurable: true, get: clientWidth })
+  resizeObservers.forEach(({ callback }) => callback())
+  return clientWidth
+}
+
+const getOverlay = () => {
+  const minimapContainer = createMock.mock.calls[0][0].container as HTMLElement
+  const overlay = minimapContainer.querySelector('[part="minimap-overlay"]') as HTMLElement
+  return { minimapContainer, overlay }
+}
+
 const createInitializedMinimap = async () => {
   const miniWaveSurfer = createMiniWaveSurfer()
   const mainWaveSurfer = createMainWaveSurfer()
@@ -85,7 +111,15 @@ const createInitializedMinimap = async () => {
 }
 
 describe('MinimapPlugin', () => {
+  const OriginalResizeObserver = (global as any).ResizeObserver
+
+  beforeEach(() => {
+    resizeObservers.length = 0
+    ;(global as any).ResizeObserver = FakeResizeObserver
+  })
+
   afterEach(() => {
+    ;(global as any).ResizeObserver = OriginalResizeObserver
     jest.clearAllMocks()
     jest.useRealTimers()
   })
@@ -149,10 +183,12 @@ describe('MinimapPlugin', () => {
     plugin._init(mainWaveSurfer as any)
     await Promise.resolve()
 
-    const minimapContainer = createMock.mock.calls[0][0].container as HTMLElement
-    const overlay = minimapContainer.querySelector('[part="minimap-overlay"]') as HTMLElement
+    const { minimapContainer, overlay } = getOverlay()
+    resizeMinimap(minimapContainer, 400)
 
-    expect(overlay.style.transition).toBe('left 100ms ease-out, width 100ms ease-out')
+    // The overlay follows the view every frame during playback, so there is
+    // no transition to restart on each frame
+    expect(overlay.style.transition).toBe('')
 
     mainWaveSurfer.__setScroll(180)
     mainWaveSurfer.emit('redraw')
@@ -162,14 +198,63 @@ describe('MinimapPlugin', () => {
     mainWaveSurfer.__setWrapperWidth(400)
     mainWaveSurfer.emit('redraw')
 
-    expect(overlay.style.left).toBe('75%')
+    // 75% of the 400px minimap
+    expect(overlay.style.transform).toBe('translateX(300px)')
     expect(overlay.style.width).toBe('25%')
 
     mainWaveSurfer.__setScroll(200)
     mainWaveSurfer.emit('scroll', 15, 30, 200, 400)
 
-    expect(overlay.style.left).toBe('50%')
+    expect(overlay.style.transform).toBe('translateX(200px)')
     expect(overlay.style.width).toBe('50%')
+  })
+
+  test('moves the overlay with a transform in pixels of the minimap width, not with left', async () => {
+    const { mainWaveSurfer } = await createInitializedMinimap()
+    const { minimapContainer, overlay } = getOverlay()
+    const clientWidth = resizeMinimap(minimapContainer, 400)
+    clientWidth.mockClear()
+
+    // The duration is 30 s (see createMainWaveSurfer)
+    mainWaveSurfer.emit('scroll', 7.5, 15, 150, 300)
+    expect(overlay.style.transform).toBe('translateX(100px)')
+    expect(overlay.style.width).toBe('25%')
+
+    // Full width: the whole duration is in view
+    mainWaveSurfer.emit('scroll', 0, 30, 0, 500)
+    expect(overlay.style.transform).toBe('translateX(0px)')
+    expect(overlay.style.width).toBe('100%')
+
+    // Zero width: the overlay is still placed where the visible range starts
+    mainWaveSurfer.emit('scroll', 15, 15, 250, 250)
+    expect(overlay.style.transform).toBe('translateX(200px)')
+    expect(overlay.style.width).toBe('0%')
+
+    mainWaveSurfer.emit('scroll', 30, 30, 500, 500)
+    expect(overlay.style.transform).toBe('translateX(400px)')
+    expect(overlay.style.width).toBe('0%')
+
+    expect(overlay.style.left).toBe('0px')
+    // Scrolls use the cached width: no layout read
+    expect(clientWidth).not.toHaveBeenCalled()
+  })
+
+  test('repositions the overlay when the minimap is resized, and stops observing on destroy', async () => {
+    const { plugin, mainWaveSurfer } = await createInitializedMinimap()
+    const { minimapContainer, overlay } = getOverlay()
+
+    resizeMinimap(minimapContainer, 400)
+    mainWaveSurfer.emit('scroll', 15, 22.5, 250, 375)
+    expect(overlay.style.transform).toBe('translateX(200px)')
+
+    // No scroll in between: the resize alone moves the overlay
+    resizeMinimap(minimapContainer, 800)
+    expect(overlay.style.transform).toBe('translateX(400px)')
+    expect(overlay.style.width).toBe('25%')
+
+    expect(resizeObservers).toHaveLength(1)
+    plugin.destroy()
+    expect(resizeObservers[0].disconnect).toHaveBeenCalled()
   })
 
   test('does not re-emit destroy when the nested wavesurfer is recreated', async () => {
