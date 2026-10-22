@@ -1,0 +1,340 @@
+import SpectrogramPlugin from '../plugins/spectrogram.js'
+import { createFakeWaveSurfer } from './helpers/fake-wavesurfer.js'
+import { createFakeAudioBuffer } from './helpers/audio-buffer.js'
+import { createEmitter } from './helpers/create-emitter.js'
+
+// Full rendering mode paints each canvas from ImageBitmaps, which createImageBitmap delivers
+// asynchronously: the HTML spec resolves its promise from a queued task, so a frame can be painted
+// before the bitmap is drawn. These tests hold every bitmap until the test delivers it, to see what
+// is on screen while a redraw is in flight. jsdom has no 2D context, ImageData or createImageBitmap,
+// so all three are stubbed.
+
+type HeldBitmap = { close: jest.Mock; resolve: () => void; reject: () => void }
+
+/** Bitmaps requested and not yet delivered, oldest first */
+let held: HeldBitmap[]
+const contexts = new Map<HTMLCanvasElement, Record<string, any>>()
+const originalImageData = (globalThis as any).ImageData
+const originalCreateImageBitmap = (globalThis as any).createImageBitmap
+const plugins: any[] = []
+
+beforeEach(() => {
+  held = []
+  contexts.clear()
+  jest.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (this: HTMLCanvasElement) {
+    if (!contexts.has(this)) {
+      contexts.set(this, { canvas: this, fillStyle: '', fillRect: jest.fn(), drawImage: jest.fn(), scale: jest.fn() })
+    }
+    return contexts.get(this)
+  } as any)
+  ;(globalThis as any).ImageData = class {
+    data: Uint8ClampedArray
+    constructor(
+      public width: number,
+      public height: number,
+    ) {
+      this.data = new Uint8ClampedArray(width * height * 4)
+    }
+  }
+  ;(globalThis as any).createImageBitmap = jest.fn(
+    () =>
+      new Promise((resolve, reject) => {
+        const bitmap = { close: jest.fn() }
+        held.push({
+          close: bitmap.close,
+          resolve: () => resolve(bitmap),
+          reject: () => reject(new Error('createImageBitmap failed')),
+        })
+      }),
+  )
+})
+
+afterEach(() => {
+  plugins.splice(0).forEach((plugin) => plugin.destroy())
+  jest.useRealTimers()
+  jest.restoreAllMocks()
+  ;(globalThis as any).ImageData = originalImageData
+  ;(globalThis as any).createImageBitmap = originalCreateImageBitmap
+})
+
+function createPlugin(
+  options: Record<string, unknown> = {},
+  { width = 600, clientWidth = 600, decoded = null as AudioBuffer | null } = {},
+) {
+  const emitter = createEmitter()
+  const wrapper = document.createElement('div')
+  const size = { width }
+  Object.defineProperty(wrapper, 'offsetWidth', { get: () => size.width })
+  Object.defineProperty(wrapper, 'clientWidth', { value: clientWidth })
+
+  const plugin: any = SpectrogramPlugin.create({ scale: 'linear', ...options })
+  plugin._init(createFakeWaveSurfer({ on: emitter.on, getWrapper: () => wrapper, getDecodedData: () => decoded }))
+  plugins.push(plugin)
+  const internals = plugin.__spectrogramInternalsForTests()
+  // The sample rate the drawn frequency range is scaled against
+  internals.buffer = createFakeAudioBuffer(new Float32Array(8000))
+
+  return { plugin, internals, emitter, wrapper, size }
+}
+
+type Harness = ReturnType<typeof createPlugin>
+
+/** [channel][frame][bin] frequency data */
+function makeFrames(channels = 1): Uint8Array[][] {
+  return Array.from({ length: channels }, () =>
+    Array.from({ length: 4 }, (_, frame) => Uint8Array.from({ length: 8 }, (_, bin) => frame * 8 + bin)),
+  )
+}
+
+/** Runs pending promise continuations without advancing any timer */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 50; i++) await Promise.resolve()
+}
+
+/** Delivers the given bitmaps (by default every held one) and lets the draws waiting for them finish */
+async function deliver(bitmaps: HeldBitmap[] = held.splice(0)): Promise<void> {
+  bitmaps.forEach((bitmap) => bitmap.resolve())
+  await flush()
+}
+
+function drawImageOf(canvas: HTMLCanvasElement): jest.Mock {
+  return contexts.get(canvas)?.drawImage
+}
+
+/** The plugin's attached canvases are exactly `expected`: the same elements, in order */
+function expectShown(h: Harness, expected: HTMLCanvasElement[]): void {
+  const shown = Array.from(h.internals.canvasContainer.querySelectorAll('canvas'))
+  expect(shown).toHaveLength(expected.length)
+  shown.forEach((canvas, i) => expect(canvas).toBe(expected[i]))
+}
+
+describe('SpectrogramPlugin full rendering mode redraws', () => {
+  it('keeps the previous canvas on screen until the new bitmap is drawn', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    const [previous] = h.internals.canvases
+    expectShown(h, [previous])
+
+    h.internals.drawSpectrogram(makeFrames())
+    const [next] = h.internals.canvases
+    await flush()
+
+    // Pre-fix the previous canvas was removed at once and the new, still blank one attached
+    expectShown(h, [previous])
+    expect(drawImageOf(next)).not.toHaveBeenCalled()
+
+    await deliver()
+
+    expect(drawImageOf(next)).toHaveBeenCalledTimes(1)
+    expectShown(h, [next])
+  })
+
+  it('replaces all canvases of a draw in one step, once each has its bitmap', async () => {
+    // 600px in canvases of at most 250px: three canvases, all drawn up front
+    const h = createPlugin({ maxCanvasWidth: 250 })
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    const previous = h.internals.canvases.slice()
+    expect(previous).toHaveLength(3)
+    expectShown(h, previous)
+
+    h.internals.drawSpectrogram(makeFrames())
+    const next = h.internals.canvases.slice()
+    const bitmaps = held.splice(0)
+    expect(bitmaps).toHaveLength(3)
+
+    await deliver(bitmaps.slice(0, 2))
+    expectShown(h, previous)
+
+    await deliver(bitmaps.slice(2))
+    expectShown(h, next)
+  })
+
+  it('waits for the bitmap of every channel when channels are split', async () => {
+    const h = createPlugin({ splitChannels: true })
+    h.internals.drawSpectrogram(makeFrames(2))
+    await deliver()
+    const [previous] = h.internals.canvases
+
+    h.internals.drawSpectrogram(makeFrames(2))
+    const [next] = h.internals.canvases
+    const [firstChannel, secondChannel] = held.splice(0)
+
+    await deliver([firstChannel])
+    expectShown(h, [previous])
+
+    await deliver([secondChannel])
+    expectShown(h, [next])
+    expect(drawImageOf(next)).toHaveBeenCalledTimes(2)
+  })
+
+  it('never shows the canvases of a superseded redraw, and closes their bitmaps', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    const [shown] = h.internals.canvases
+
+    h.internals.drawSpectrogram(makeFrames())
+    const [superseded] = h.internals.canvases
+    const [supersededBitmap] = held.splice(0)
+    h.internals.drawSpectrogram(makeFrames())
+    const [latest] = h.internals.canvases
+
+    // The superseded draw's bitmap arrives first: the picture on screen stays
+    await deliver([supersededBitmap])
+    expectShown(h, [shown])
+    expect(drawImageOf(superseded)).not.toHaveBeenCalled()
+    expect(supersededBitmap.close).toHaveBeenCalled()
+
+    await deliver()
+    expectShown(h, [latest])
+  })
+
+  it('ignores a superseded bitmap that arrives after the latest draw is shown', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    const [superseded] = h.internals.canvases
+    const [supersededBitmap] = held.splice(0)
+    h.internals.drawSpectrogram(makeFrames())
+    const [latest] = h.internals.canvases
+
+    await deliver()
+    expectShown(h, [latest])
+
+    await deliver([supersededBitmap])
+    expectShown(h, [latest])
+    expect(superseded.parentNode).toBeNull()
+    expect(drawImageOf(superseded)).not.toHaveBeenCalled()
+    expect(supersededBitmap.close).toHaveBeenCalled()
+  })
+
+  it('still replaces the picture when a bitmap fails, without that channel', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+
+    h.internals.drawSpectrogram(makeFrames())
+    const [next] = h.internals.canvases
+    held.splice(0).forEach((bitmap) => bitmap.reject())
+    await flush()
+
+    expectShown(h, [next])
+    expect(drawImageOf(next)).not.toHaveBeenCalled()
+  })
+
+  it('removes the shown and the pending canvases at once when a redraw has nothing to draw', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    h.internals.drawSpectrogram(makeFrames())
+    const [pending] = h.internals.canvases
+
+    h.internals.drawSpectrogram([])
+    expectShown(h, [])
+
+    await deliver()
+    expectShown(h, [])
+    expect(pending.parentNode).toBeNull()
+  })
+
+  it('leaves no canvas behind when destroyed during a redraw, and closes the pending bitmaps', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    h.internals.drawSpectrogram(makeFrames())
+    const [pending] = h.internals.canvases
+    const bitmaps = held.splice(0)
+
+    h.plugin.destroy()
+    expectShown(h, [])
+
+    await deliver(bitmaps)
+    expectShown(h, [])
+    expect(pending.parentNode).toBeNull()
+    expect(drawImageOf(pending)).not.toHaveBeenCalled()
+    bitmaps.forEach((bitmap) => expect(bitmap.close).toHaveBeenCalled())
+  })
+
+  it('leaves no canvas behind when destroyed before the first draw is painted', async () => {
+    const h = createPlugin()
+    h.internals.drawSpectrogram(makeFrames())
+    const [pending] = h.internals.canvases
+    const bitmaps = held.splice(0)
+
+    h.plugin.destroy()
+    await deliver(bitmaps)
+
+    expectShown(h, [])
+    expect(pending.parentNode).toBeNull()
+    bitmaps.forEach((bitmap) => expect(bitmap.close).toHaveBeenCalled())
+  })
+
+  it('adds canvases drawn on scroll to a pending replacement, and shows later ones once painted', async () => {
+    jest.useFakeTimers()
+    // 6000px wide in a 600px viewport: six 1000px canvases, each drawn once near the viewport
+    const h = createPlugin({ maxCanvasWidth: 1000 }, { width: 6000, clientWidth: 600 })
+    let scrollLeft = 0
+    Object.defineProperty(h.wrapper, 'scrollLeft', { get: () => scrollLeft })
+    const scrollTo = (x: number) => {
+      scrollLeft = x
+      h.wrapper.dispatchEvent(new Event('scroll'))
+      jest.advanceTimersByTime(16)
+    }
+
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    // The viewport and half its width on either side: canvases 0 and 1
+    const previous = h.internals.canvases.slice()
+    expect(previous).toHaveLength(2)
+    expectShown(h, previous)
+
+    h.internals.drawSpectrogram(makeFrames())
+    // Scrolled before the new bitmaps arrive: canvases 2 and 3 join the replacement
+    scrollTo(1500)
+    const next = h.internals.canvases.slice()
+    expect(next).toHaveLength(4)
+    const bitmaps = held.splice(0)
+
+    await deliver(bitmaps.slice(0, 2))
+    expectShown(h, previous)
+
+    await deliver(bitmaps.slice(2))
+    expectShown(h, next)
+
+    // Nothing is left to replace: a canvas drawn on scroll is shown as soon as it is painted
+    scrollTo(3500)
+    const [fifth, sixth] = h.internals.canvases.slice(4)
+    const [fifthBitmap, sixthBitmap] = held.splice(0)
+
+    await deliver([fifthBitmap])
+    expectShown(h, [...next, fifth])
+
+    await deliver([sixthBitmap])
+    expectShown(h, [...next, fifth, sixth])
+  })
+
+  it('keeps the picture on screen through the redraw that follows a resize', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    const h = createPlugin({}, { decoded })
+
+    // The initial render: the 0 ms init tick, then the 50 ms render throttle
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+    const [previous] = h.internals.canvases
+    expectShown(h, [previous])
+
+    // A wider container redraws from the retained frequency data
+    h.size.width = 800
+    h.emitter.emit('redraw')
+    jest.advanceTimersByTime(50)
+    const [next] = h.internals.canvases
+    expect(next.style.width).toBe('800px')
+    expectShown(h, [previous])
+
+    await deliver()
+    expectShown(h, [next])
+  })
+})

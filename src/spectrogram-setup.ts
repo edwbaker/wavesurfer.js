@@ -539,7 +539,12 @@ export function spectrogramSetup(
   const renderThrottleMs = 50 // Reduced frequency for better performance
   const zoomThreshold = 0.05 // More sensitive zoom detection
   let drawnCanvases: Record<number, boolean> = {}
+  // The latest draw's canvases, each attached once its bitmaps are drawn (see showPaintedCanvas)
   let canvases: HTMLCanvasElement[] = []
+  // The latest draw's canvases whose bitmaps are still being drawn
+  const paintingCanvases = new Set<HTMLCanvasElement>()
+  // An earlier draw's canvases, kept on screen until all of the latest draw's canvases are painted
+  let previousCanvases: HTMLCanvasElement[] = []
   let scrollUnsubscribe: (() => void) | null = null
 
   // ---- setOptions() state ----
@@ -632,14 +637,41 @@ export function spectrogramSetup(
     canvas.height = Math.round(height * pixelRatio)
     if (pixelRatio !== 1) canvas.getContext('2d')?.scale(pixelRatio, pixelRatio)
 
-    canvasContainer.appendChild(canvas)
+    // Attached once painted, see showPaintedCanvas
     return canvas
   }
 
   function clearCanvases(): void {
     canvases.forEach((canvas) => canvas.remove())
+    previousCanvases.forEach((canvas) => canvas.remove())
     canvases = []
+    previousCanvases = []
+    paintingCanvases.clear()
     drawnCanvases = {}
+  }
+
+  // Starts a new draw's canvases. The canvases on screen stay there until the new ones are
+  // painted, while canvases of a superseded draw that never got on screen are dropped
+  function replaceCanvases(): void {
+    previousCanvases.push(...canvases.filter((canvas) => canvas.parentNode))
+    canvases = []
+    paintingCanvases.clear()
+    drawnCanvases = {}
+  }
+
+  // Attaches a canvas of the latest draw once its bitmaps are drawn. While an earlier draw's
+  // canvases are on screen, the latest draw's canvases replace them in one step once all of them
+  // are painted, so a redraw never shows a blank frame
+  function showPaintedCanvas(canvas: HTMLCanvasElement): void {
+    // Dropped by a newer draw, clearCanvases() or destroy()
+    if (!paintingCanvases.delete(canvas)) return
+    if (previousCanvases.length === 0) {
+      canvasContainer.appendChild(canvas)
+    } else if (paintingCanvases.size === 0) {
+      previousCanvases.forEach((previous) => previous.remove())
+      previousCanvases = []
+      canvases.forEach((painted) => canvasContainer.appendChild(painted))
+    }
   }
 
   function clearExcessCanvases(): void {
@@ -1593,7 +1625,7 @@ export function spectrogramSetup(
     freqFrom: number,
     freqMin: number,
     freqMax: number,
-  ): void {
+  ): Promise<void> {
     // Data is already resampled for the total width
     const bitmapHeight = resampledPixels[0].length
 
@@ -1605,7 +1637,7 @@ export function spectrogramSetup(
     )
     const segmentPixels = resampledPixels.slice(startIndex, endIndex)
 
-    if (segmentPixels.length === 0) return
+    if (segmentPixels.length === 0) return Promise.resolve()
 
     // Calculate frequency scaling
     const rMin = hzToScale(freqMin, settings.scale) / hzToScale(freqFrom, settings.scale)
@@ -1621,18 +1653,18 @@ export function spectrogramSetup(
       Math.round(bitmapHeight * (rMax1 - rMin)),
     )
 
-    bitmapPromise
+    return bitmapPromise
       .then((bitmap) => {
         try {
-          // Check if canvas is still valid before drawing
-          if (canvasCtx.canvas.parentNode) {
+          // Skip a canvas that a newer draw, clearCanvases() or destroy() has dropped
+          if (paintingCanvases.has(canvasCtx.canvas)) {
             const drawHeight = (segmentHeight * rMax1) / rMax
             const drawY = yOffset + segmentHeight * (1 - rMax1 / rMax)
 
             canvasCtx.drawImage(bitmap, 0, drawY, canvasWidth, drawHeight)
           }
         } finally {
-          // Clean up bitmap to free memory, even if the canvas was removed before it resolved.
+          // Clean up bitmap to free memory, even if the canvas was dropped before it resolved.
           // The 'close' in bitmap guard is deliberate: some createImageBitmap polyfills (used in
           // older/non-browser environments) don't implement .close() despite lib.dom's ImageBitmap
           // type always declaring it.
@@ -1643,7 +1675,7 @@ export function spectrogramSetup(
       })
       .catch(() => {
         // Nothing to clean up on error - createImageBitmap rejected, so there's no bitmap and
-        // no canvas write to skip.
+        // no canvas write to skip. The canvas is still shown, without this channel.
       })
   }
 
@@ -1669,9 +1701,6 @@ export function spectrogramSetup(
       ? (input as Uint8Array[][])
       : [input as Uint8Array[]]
 
-    // Clear existing canvases
-    clearCanvases()
-
     // Set the height to fit all channels
     const totalHeight = settings.height * frequenciesData.length
     wrapper.style.height = totalHeight + 'px'
@@ -1680,7 +1709,13 @@ export function spectrogramSetup(
     const perCanvasWidth = Math.min(maxCanvasWidth, totalWidth)
 
     // Nothing to render
-    if (totalWidth === 0 || totalHeight === 0) return
+    if (totalWidth === 0 || totalHeight === 0) {
+      clearCanvases()
+      return
+    }
+
+    // The current canvases stay on screen until this draw's canvases are painted
+    replaceCanvases()
 
     // Calculate number of canvases needed
     const numCanvases = Math.ceil(totalWidth / perCanvasWidth)
@@ -1738,31 +1773,39 @@ export function spectrogramSetup(
 
       const canvas = createSingleCanvas(canvasWidth, totalHeight, offset)
       canvases.push(canvas)
+      paintingCanvases.add(canvas)
       const canvasCtx = canvas.getContext('2d')
+      const channelsDrawn: Promise<void>[] = []
 
-      if (!canvasCtx) return
+      if (canvasCtx) {
+        // Draw background if needed
+        if (shouldDrawBackground && bgColor) {
+          canvasCtx.fillStyle = `rgba(${bgColor[0] * 255}, ${bgColor[1] * 255}, ${bgColor[2] * 255}, ${bgColor[3]})`
+          canvasCtx.fillRect(0, 0, canvasWidth, totalHeight)
+        }
 
-      // Draw background if needed
-      if (shouldDrawBackground && bgColor) {
-        canvasCtx.fillStyle = `rgba(${bgColor[0] * 255}, ${bgColor[1] * 255}, ${bgColor[2] * 255}, ${bgColor[3]})`
-        canvasCtx.fillRect(0, 0, canvasWidth, totalHeight)
+        // Render each channel for this canvas segment
+        for (let c = 0; c < resampledData.length; c++) {
+          channelsDrawn.push(
+            drawSpectrogramSegment(
+              resampledData[c],
+              canvasCtx,
+              canvasWidth,
+              settings.height,
+              c * settings.height,
+              offset,
+              totalWidth,
+              freqFrom,
+              freqMin,
+              freqMax,
+            ),
+          )
+        }
       }
 
-      // Render each channel for this canvas segment
-      for (let c = 0; c < resampledData.length; c++) {
-        drawSpectrogramSegment(
-          resampledData[c],
-          canvasCtx,
-          canvasWidth,
-          settings.height,
-          c * settings.height,
-          offset,
-          totalWidth,
-          freqFrom,
-          freqMin,
-          freqMax,
-        )
-      }
+      // Shown once every channel is drawn. This always settles asynchronously, so a pass creates
+      // all of its canvases before the first one can be shown
+      Promise.all(channelsDrawn).then(() => showPaintedCanvas(canvas))
     }
 
     // Store rendering parameters for lazy loading
