@@ -745,11 +745,20 @@ class WaveSurfer extends EventEmitter<WaveSurferEvents> {
         if (!loadScope.disposed) {
           this.wavesurferActions.setLoadPhase('decoding')
         }
-        playbackBuffer = await Decoder.decode(await blob.arrayBuffer())
+        // Read the blob before decoding it, so a load cancelled during the read never starts a decode
+        const arrayBuffer = await blob.arrayBuffer()
         // Guard: bail if a newer load started or the instance was destroyed
         if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
+        playbackBuffer = await Decoder.decode(arrayBuffer)
+        // Guard: bail if a newer load started or the instance was destroyed
+        if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
+      }
+      // The media can have been replaced by an HTML element while the file was decoding. The buffer is then not played,
+      // and the load takes the regular source path.
+      if (playbackBuffer && this.webAudioPlayer && blob) {
         this.player.setDecodedSrc(blob, playbackBuffer)
       } else {
+        playbackBuffer = null
         // Set the mediaelement source
         this.player.setSrc(url, blob)
       }
@@ -1102,7 +1111,11 @@ class WaveSurfer extends EventEmitter<WaveSurferEvents> {
     this.load('', [[0]], 0.001).catch(() => undefined)
   }
 
-  /** Set HTML media element */
+  /**
+   * Set the media element that plays the audio. This can be called while a load is in progress. The load then finishes
+   * with the element that is current when it reaches its source step: a file that was decoded for WebAudio playback
+   * but whose element has been replaced by an HTML element is loaded through that element's source instead.
+   */
   public setMediaElement(element: HTMLMediaElement) {
     if (this.isDestroyed) return
     this.unsubscribePlayerEvents()

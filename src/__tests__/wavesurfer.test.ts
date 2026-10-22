@@ -1101,4 +1101,87 @@ describe('terminal destroy: mutating APIs are no-ops', () => {
       Decoder.canResample.mockReturnValue(false)
     }
   })
+
+  test('a load cancelled while its blob is read does not start a decode', async () => {
+    const { MockAudioContext } = makeMockAudioContext()
+    const originalAudioContext = (globalThis as any).AudioContext
+    ;(globalThis as any).AudioContext = MockAudioContext
+    const originalCreateObjectURL = URL.createObjectURL
+    const originalRevokeObjectURL = URL.revokeObjectURL
+    URL.createObjectURL = jest.fn(() => 'blob:decoded')
+    URL.revokeObjectURL = jest.fn()
+    const { default: Decoder } = (await import('../decoder.js')) as any
+    Decoder.decode.mockReset().mockResolvedValue({ duration: 2, numberOfChannels: 1 })
+    Decoder.canResample.mockReturnValue(true)
+    Decoder.resample.mockReset().mockResolvedValue({ duration: 2, numberOfChannels: 1 })
+    try {
+      const ws = WaveSurfer.create({ container: document.createElement('div'), backend: 'WebAudio' })
+      let finishRead: (buffer: ArrayBuffer) => void = () => undefined
+      const cancelled = {
+        type: 'audio/wav',
+        arrayBuffer: () => new Promise<ArrayBuffer>((resolve) => (finishRead = resolve)),
+      } as unknown as Blob
+      const replacement = {
+        type: 'audio/wav',
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)),
+      } as unknown as Blob
+
+      const first = ws.loadBlob(cancelled)
+      await new Promise((r) => setTimeout(r, 0)) // let the first load reach its blob read
+      const second = ws.loadBlob(replacement) // supersedes the first load
+      finishRead(new ArrayBuffer(16))
+      await Promise.allSettled([first, second])
+
+      // Only the replacement is decoded: the cancelled read's 16 bytes never reach the decoder
+      expect(Decoder.decode).toHaveBeenCalledTimes(1)
+      expect(Decoder.decode.mock.calls[0][0].byteLength).toBe(8)
+      ws.destroy()
+    } finally {
+      ;(globalThis as any).AudioContext = originalAudioContext
+      URL.createObjectURL = originalCreateObjectURL
+      URL.revokeObjectURL = originalRevokeObjectURL
+      Decoder.canResample.mockReturnValue(false)
+    }
+  })
+
+  test('a backend swap to an HTML element while the file decodes loads the file through that element', async () => {
+    const { MockAudioContext } = makeMockAudioContext()
+    const originalAudioContext = (globalThis as any).AudioContext
+    ;(globalThis as any).AudioContext = MockAudioContext
+    const originalCreateObjectURL = URL.createObjectURL
+    const originalRevokeObjectURL = URL.revokeObjectURL
+    URL.createObjectURL = jest.fn(() => 'blob:decoded')
+    URL.revokeObjectURL = jest.fn()
+    const { default: Decoder } = (await import('../decoder.js')) as any
+    const waveform = { duration: 2, numberOfChannels: 1 } as AudioBuffer
+    let finishDecode: (buffer: AudioBuffer) => void = () => undefined
+    Decoder.decode
+      .mockReset()
+      .mockImplementationOnce(() => new Promise<AudioBuffer>((resolve) => (finishDecode = resolve)))
+      .mockResolvedValue(waveform)
+    Decoder.canResample.mockReturnValue(true)
+    try {
+      const ws = WaveSurfer.create({ container: document.createElement('div'), backend: 'WebAudio' })
+      const blob = { type: 'audio/wav', arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) } as unknown as Blob
+      const setSrc = jest.spyOn((ws as any).player, 'setSrc')
+      const setDecodedSrc = jest.spyOn((ws as any).player, 'setDecodedSrc')
+
+      // The duration is passed, so the load does not wait for 'loadedmetadata' on the new element
+      const load = ws.loadBlob(blob, undefined, 2)
+      await new Promise((r) => setTimeout(r, 0)) // let the load reach the decode
+      ws.setMediaElement(document.createElement('audio'))
+      finishDecode({ duration: 2, numberOfChannels: 1 } as AudioBuffer)
+      await load
+
+      expect(setDecodedSrc).not.toHaveBeenCalled()
+      expect(setSrc).toHaveBeenCalledWith('', blob)
+      expect(ws.getDecodedData()).toBe(waveform)
+      ws.destroy()
+    } finally {
+      ;(globalThis as any).AudioContext = originalAudioContext
+      URL.createObjectURL = originalCreateObjectURL
+      URL.revokeObjectURL = originalRevokeObjectURL
+      Decoder.canResample.mockReturnValue(false)
+    }
+  })
 })
