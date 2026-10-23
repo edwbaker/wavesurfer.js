@@ -737,6 +737,7 @@ export function spectrogramSetup(
   // then its picture stays aligned with the waveform, and in view
   function alignPicture(): void {
     const width = shownWidth > 0 ? getWidth() : 0
+    canvasContainer.style.width = shownWidth > 0 ? `${shownWidth}px` : '100%'
     canvasContainer.style.transform = width > 0 && width !== shownWidth ? `scaleX(${width / shownWidth})` : ''
   }
 
