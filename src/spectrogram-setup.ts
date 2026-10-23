@@ -23,8 +23,9 @@ import {
   unitType,
   createWrapperClickHandler,
   AUTO_GAIN_BUFFER_BUDGET_BYTES,
-  paintColumnPixels,
+  createSpectrogramBitmap,
   getCanvasPixelRatio,
+  getDefaultMaxCanvasWidth,
 } from './spectrogram-render-utils.js'
 import { computeFrequencies, type FrequencyParams } from './spectrogram-frequencies.js'
 // Windowed rendering strategy: segment map, eviction, uncovered-range
@@ -200,7 +201,11 @@ export type SpectrogramPluginOptions = {
    * feed. See loadFrequenciesData's own doc comment for the same rationale.
    **/
   frequenciesDataUrl?: string
-  /** Maximum width of individual canvas elements in pixels (default: 30000) */
+  /**
+   * Maximum width of individual canvas elements in pixels. 'full' mode only. (default: 4096, or
+   * 8192 / devicePixelRatio when that is smaller, which keeps every canvas within the size
+   * browsers draw on the GPU)
+   */
   maxCanvasWidth?: number
   /** Use web worker for FFT calculations (default: false) */
   useWebWorker?: boolean
@@ -519,7 +524,9 @@ export function spectrogramSetup(
   // __spectrogramInternalsForTests().autoGainBudgetBytes).
   let autoGainBudgetBytes = AUTO_GAIN_BUFFER_BUDGET_BYTES
 
-  const maxCanvasWidth = options.maxCanvasWidth || 30000
+  // An explicit maxCanvasWidth, or the default for the current pixel ratio, read at each draw
+  const explicitMaxCanvasWidth = options.maxCanvasWidth || 0
+  const getMaxCanvasWidth = () => explicitMaxCanvasWidth || getDefaultMaxCanvasWidth()
 
   // ---- Mutable render/cache/worker state (closure-owned, replaces the pre-port instance fields) ----
   let buffer: AudioBuffer | null = null
@@ -538,8 +545,28 @@ export function spectrogramSetup(
   let lastZoomLevel = 0
   const renderThrottleMs = 50 // Reduced frequency for better performance
   const zoomThreshold = 0.05 // More sensitive zoom detection
+  // The index each canvas was drawn for, so clearExcessCanvases can tell how far from view it is
+  const canvasIndexes = new WeakMap<HTMLCanvasElement, number>()
   let drawnCanvases: Record<number, boolean> = {}
+  // The latest draw's canvases, each attached once its bitmaps are drawn (see showPaintedCanvas)
   let canvases: HTMLCanvasElement[] = []
+  // The latest draw's canvases whose bitmaps are still being drawn
+  const paintingCanvases = new Set<HTMLCanvasElement>()
+  // An earlier draw's canvases, kept on screen until all of the latest draw's canvases are painted
+  let previousCanvases: HTMLCanvasElement[] = []
+  // The latest draw's readiness, run once its canvases are painted and on screen (see finishReplacement)
+  let pendingReady: (() => void) | null = null
+  // The latest draw's wrapper height and labels, applied when its canvases replace an earlier picture
+  let pendingLayout: (() => void) | null = null
+  // The width the latest draw is drawn for, and the width the picture on screen was drawn for (0 when
+  // there is none), which differ after a zoom or a resize until a redraw for the new width is shown.
+  // Meanwhile the picture is shown stretched by shownScale, or as drawn when that is 1
+  let latestWidth = 0
+  let shownWidth = 0
+  let shownScale = 1
+  // The request completions of the latest draw and of the draws it replaced before they were
+  // painted, run in order once it is on screen (see drawSpectrogram)
+  let pendingCompletions: Array<() => void> = []
   let scrollUnsubscribe: (() => void) | null = null
 
   // ---- setOptions() state ----
@@ -604,6 +631,8 @@ export function spectrogramSetup(
         width: '100%',
         height: '100%',
         zIndex: '4',
+        // A picture drawn for another width is stretched from the left (see alignPicture)
+        transformOrigin: '0 0',
       },
     },
     wrapper,
@@ -632,21 +661,150 @@ export function spectrogramSetup(
     canvas.height = Math.round(height * pixelRatio)
     if (pixelRatio !== 1) canvas.getContext('2d')?.scale(pixelRatio, pixelRatio)
 
-    canvasContainer.appendChild(canvas)
+    // Attached once painted, see showPaintedCanvas
     return canvas
   }
 
   function clearCanvases(): void {
+    // The cleared draw's lazy drawing must not bring its picture back on the next scroll
+    scrollUnsubscribe?.()
+    scrollUnsubscribe = null
     canvases.forEach((canvas) => canvas.remove())
+    previousCanvases.forEach((canvas) => canvas.remove())
     canvases = []
+    previousCanvases = []
+    shownWidth = 0
+    alignPicture()
+    paintingCanvases.clear()
     drawnCanvases = {}
+    pendingReady = null
+    pendingLayout = null
+    // A draw with nothing to show runs these first, unless its analysis failed: then the failure
+    // rejects what they wait for, as destroy() does
+    pendingCompletions = []
   }
 
-  function clearExcessCanvases(): void {
-    // Clear canvases to avoid too many DOM nodes
-    if (Object.keys(drawnCanvases).length > MAX_NODES) {
-      clearCanvases()
+  // Starts a new draw's canvases. The canvases on screen stay there until the new ones are
+  // painted, while canvases of a superseded draw that never got on screen are dropped, and so are
+  // its readiness and layout. Its request completion waits for the draw that replaces it
+  function replaceCanvases(): void {
+    previousCanvases.push(...canvases.filter((canvas) => canvas.parentNode))
+    canvases = []
+    paintingCanvases.clear()
+    drawnCanvases = {}
+    pendingReady = null
+    pendingLayout = null
+  }
+
+  // Attaches a canvas of the latest draw once its bitmaps are drawn. While an earlier draw's
+  // canvases are on screen, the latest draw's canvases replace them in one step once all of them
+  // are painted, so a redraw never shows a blank frame
+  function showPaintedCanvas(canvas: HTMLCanvasElement): void {
+    // Dropped by a newer draw, clearCanvases() or destroy()
+    if (!paintingCanvases.delete(canvas)) return
+    if (previousCanvases.length === 0) {
+      canvasContainer.appendChild(canvas)
+      // The latest draw's picture is the one on screen
+      if (shownWidth !== latestWidth) {
+        shownWidth = latestWidth
+        alignPicture()
+      }
     }
+    finishReplacement()
+  }
+
+  // Once none of the latest draw's canvases is still painting, puts them on screen in place of an
+  // earlier draw's canvases, with their wrapper height and labels, then reports the draw ready. Also
+  // run after a pass of lazy drawing, whose trimming can leave nothing painting without any canvas
+  // finishing
+  function finishReplacement(): void {
+    if (paintingCanvases.size > 0) return
+    if (previousCanvases.length > 0) {
+      previousCanvases.forEach((previous) => previous.remove())
+      previousCanvases = []
+      canvases.forEach((painted) => canvasContainer.appendChild(painted))
+      shownWidth = latestWidth
+      alignPicture()
+    }
+    const layout = pendingLayout
+    pendingLayout = null
+    layout?.()
+    const ready = pendingReady
+    pendingReady = null
+    ready?.()
+  }
+
+  // Shows the picture on screen at the waveform's width. After a zoom or a resize the waveform is
+  // redrawn at once, and the spectrogram only once its redraw for the new width is painted. Until
+  // then the picture is stretched to the new width, which keeps it aligned with the waveform and in
+  // view, unless it covers more of the view as drawn: a lazily drawn picture only has canvases around
+  // the view it was drawn for, so shrinking it for a zoom out can leave most of the new view blank
+  function alignPicture(): void {
+    const width = shownWidth > 0 ? getWidth() : 0
+    const stretch = width > 0 && width !== shownWidth ? width / shownWidth : 1
+    shownScale = stretch !== 1 && coveredWidth(stretch, width) >= coveredWidth(1, width) ? stretch : 1
+    // Stretched, the container is as wide as the picture, so its box ends where the picture does
+    canvasContainer.style.width = shownScale !== 1 ? `${shownWidth}px` : '100%'
+    canvasContainer.style.transform = shownScale !== 1 ? `scaleX(${shownScale})` : ''
+  }
+
+  // How much of the view the canvases on screen cover when shown at `scale`. The view is taken within
+  // `width`, where it is once the redraw for that width replaces the picture
+  function coveredWidth(scale: number, width: number): number {
+    const viewWidth = ctx.wavesurfer?.getWidth() || 0
+    const start = Math.min(ctx.wavesurfer?.getScroll() || 0, Math.max(0, width - viewWidth))
+    const end = Math.min(start + viewWidth, width)
+    const spans = Array.from(canvasContainer.children as HTMLCollectionOf<HTMLElement>, (canvas) => {
+      const left = parseFloat(canvas.style.left) * scale
+      return [left, left + parseFloat(canvas.style.width) * scale]
+    }).sort((a, b) => a[0] - b[0])
+    let covered = 0
+    let reached = start
+    for (const [left, right] of spans) {
+      const from = Math.max(left, reached)
+      const to = Math.min(right, end)
+      if (to <= from) continue
+      covered += to - from
+      reached = to
+    }
+    return covered
+  }
+
+  // Runs the request completions waiting for the latest draw, in the order of their draws
+  function runPendingCompletions(): void {
+    const completions = pendingCompletions
+    pendingCompletions = []
+    completions.forEach((complete) => complete())
+  }
+
+  // Makes room for the canvases from startIndex to endIndex, the range about to be drawn: while more
+  // than MAX_NODES canvases would be kept, removes the canvases outside that range, farthest first.
+  // A canvas in the range is never removed, so the canvases in view stay on screen
+  function clearExcessCanvases(startIndex: number, endIndex: number): void {
+    let excess = Object.keys(drawnCanvases).length - MAX_NODES
+    for (let i = startIndex; i <= endIndex; i++) {
+      if (!drawnCanvases[i]) excess++
+    }
+    if (excess <= 0) return
+
+    // How many canvases away from the range a canvas is: 0 inside it, and for a canvas with no
+    // index, which is then kept
+    const distance = (canvas: HTMLCanvasElement) => {
+      const index = canvasIndexes.get(canvas)
+      return index === undefined ? 0 : Math.max(0, startIndex - index, index - endIndex)
+    }
+    const removed = canvases
+      .filter((canvas) => distance(canvas) > 0)
+      .sort((a, b) => distance(b) - distance(a))
+      .slice(0, excess)
+    removed.forEach((canvas) => {
+      canvas.remove()
+      // A canvas still being painted must not be put on screen once its bitmaps are drawn
+      paintingCanvases.delete(canvas)
+      // Drawn again once it is back in range
+      delete drawnCanvases[canvasIndexes.get(canvas) as number]
+    })
+    canvases = canvases.filter((canvas) => !removed.includes(canvas))
   }
 
   // Tolerant of a missing wavesurfer/wrapper (`?.` + `|| 0`, not a direct dereference): windowed
@@ -657,10 +815,6 @@ export function spectrogramSetup(
   // plugin's own `this.wavesurfer?.getWrapper()?.offsetWidth || 0`.
   function getWidth(): number {
     return ctx.wavesurfer?.getWrapper()?.offsetWidth || 0
-  }
-
-  function getWrapperWidth(): number {
-    return ctx.wavesurfer?.getWrapper()?.clientWidth || 0
   }
 
   // Single source of truth for "should this render split its channels into separate rows":
@@ -1077,9 +1231,12 @@ export function spectrogramSetup(
       )
     : null
 
+  // Draw the view as the waveform scrolls or plays, at most once per 16 ms. An event doesn't push back
+  // a draw already due, and the draw reads the view when it runs, so events less than 16 ms apart (a
+  // continuous scroll, or playback with autoScroll) keep drawing instead of waiting for them to stop
   let cancelWindowedRenderTimer: (() => void) | null = null
   function scheduleWindowedRender(): void {
-    cancelWindowedRenderTimer?.()
+    if (cancelWindowedRenderTimer) return
     cancelWindowedRenderTimer = ctx.scope.timeout(() => {
       cancelWindowedRenderTimer = null
       // Fire-and-forget from a timer callback - nothing here awaits this promise, so a
@@ -1089,6 +1246,8 @@ export function spectrogramSetup(
     }, 16) // 60fps
   }
 
+  // Unlike the draw above, a debounce: only zoom changes re-arm it, and the refresh waits for the zoom
+  // to settle
   let cancelQualityUpdateTimer: (() => void) | null = null
   function scheduleQualityUpdate(): void {
     cancelQualityUpdateTimer?.()
@@ -1133,6 +1292,7 @@ export function spectrogramSetup(
         currentOptions.labelsHzColor || currentOptions.labelsColor,
         'center',
         channels,
+        { height: settings.height, frequencyMin: settings.frequencyMin, frequencyMax, scale: settings.scale },
       )
     }
 
@@ -1156,22 +1316,32 @@ export function spectrogramSetup(
       )
       return
     }
-    await fetchAndDrawFrequencies(url)
+    // The load is drawn with the current display options, so once it is on screen it settles the
+    // display changes waiting for a draw, as a redraw would. Its data is not an analysis, so
+    // requests waiting for one keep waiting
+    await fetchAndDrawFrequencies(url, (drawn) => {
+      appliedVersion = Math.max(appliedVersion, drawn)
+      settleRequests(drawn, null, (request) => request.generation === null)
+    })
   }
 
-  async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: () => void): Promise<void> {
+  // Resolves to whether the draw reports ready, as drawSpectrogram() returns. A draw with nothing to
+  // show never does, so its beforeReady runs at once
+  async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: (version: number) => void): Promise<boolean> {
     const resp = await fetch(url)
     if (!resp.ok) {
       throw new Error('Unable to fetch frequencies data')
     }
     const data = await resp.json()
-    if (ctx.scope.disposed) return
+    if (ctx.scope.disposed) return false
     // frequenciesDataUrl's contract (see SpectrogramPluginOptions.frequenciesDataUrl) is that
     // the JSON already IS a Uint8Array[][]-shaped nested array; parsed JSON can only ever
     // produce plain number arrays (never real Uint8Array instances), but every consumer below
     // only relies on indexing/length/iteration, which plain arrays support identically. Not
     // runtime-validated, matching the pre-port behavior.
-    drawSpectrogram(data as Uint8Array[][], beforeReady)
+    const readyPending = drawSpectrogram(data as Uint8Array[][], beforeReady)
+    if (!readyPending) beforeReady?.(drawVersion)
+    return readyPending
   }
 
   async function getFrequenciesData(): Promise<Uint8Array[][] | null> {
@@ -1502,14 +1672,16 @@ export function spectrogramSetup(
     let version = -1
     let failed = false
     let completed = false
-    const completeBeforeReady = () => {
+    // Whether the draw reports ready by itself, once its canvases are on screen
+    let readyPending = false
+    const completeBeforeReady = (drawn: number) => {
       completed = true
-      completeDraw(drawVersion, generation)
+      completeDraw(drawn, generation)
     }
 
     try {
       if (frequenciesDataUrl) {
-        await fetchAndDrawFrequencies(frequenciesDataUrl, completeBeforeReady)
+        readyPending = await fetchAndDrawFrequencies(frequenciesDataUrl, completeBeforeReady)
         if (ctx.scope.disposed) return
         version = drawVersion
       } else {
@@ -1520,7 +1692,7 @@ export function spectrogramSetup(
           if (ctx.scope.disposed || !frequencies || generation !== analysisGeneration) return
           // Draw what this render computed (cache hit, fresh data, or empty on failure)
           // rather than whatever the cache field holds
-          drawSpectrogram(frequencies, completeBeforeReady)
+          readyPending = drawSpectrogram(frequencies, completeBeforeReady)
           version = drawVersion
         }
       }
@@ -1530,8 +1702,9 @@ export function spectrogramSetup(
       failed = true
     } finally {
       isRendering = false
-      // A draw without 'ready' (empty data, zero width) is settled here
-      if (version >= 0 && !failed && !completed) completeDraw(version, generation)
+      // A draw without 'ready' (empty data, zero width) is settled here. A draw still being
+      // painted settles its requests once it is on screen
+      if (version >= 0 && !failed && !completed && !readyPending) completeDraw(version, generation)
       runQueuedRerender()
       redrawIfChanged(version)
     }
@@ -1552,12 +1725,13 @@ export function spectrogramSetup(
     let version = -1
     let failed = false
     let completed = false
+    let readyPending = false
 
     try {
       // Use cached frequencies for fast re-render
-      drawSpectrogram(cachedFrequencies, () => {
+      readyPending = drawSpectrogram(cachedFrequencies, (drawn) => {
         completed = true
-        completeDraw(drawVersion, generation)
+        completeDraw(drawn, generation)
       })
       version = drawVersion
       lastZoomLevel = ctx.wavesurfer?.options.minPxPerSec || 0
@@ -1566,7 +1740,7 @@ export function spectrogramSetup(
       failed = true
     } finally {
       isRendering = false
-      if (!failed && !completed) completeDraw(version, generation)
+      if (!failed && !completed && !readyPending) completeDraw(version, generation)
       runQueuedRerender()
       redrawIfChanged(version)
     }
@@ -1593,7 +1767,9 @@ export function spectrogramSetup(
     freqFrom: number,
     freqMin: number,
     freqMax: number,
-  ): void {
+    scale: Settings['scale'],
+    colors: number[][],
+  ): Promise<void> {
     // Data is already resampled for the total width
     const bitmapHeight = resampledPixels[0].length
 
@@ -1605,42 +1781,34 @@ export function spectrogramSetup(
     )
     const segmentPixels = resampledPixels.slice(startIndex, endIndex)
 
-    if (segmentPixels.length === 0) return
-
-    // Create ImageData for this segment
-    const segmentWidth = segmentPixels.length
-    const imageData = new ImageData(segmentWidth, bitmapHeight)
-    const data = imageData.data
-
-    // Always use quality rendering - users want accurate spectrograms
-    fillImageDataQuality(data, segmentPixels, segmentWidth, bitmapHeight)
+    if (segmentPixels.length === 0) return Promise.resolve()
 
     // Calculate frequency scaling
-    const rMin = hzToScale(freqMin, settings.scale) / hzToScale(freqFrom, settings.scale)
-    const rMax = hzToScale(freqMax, settings.scale) / hzToScale(freqFrom, settings.scale)
+    const rMin = hzToScale(freqMin, scale) / hzToScale(freqFrom, scale)
+    const rMax = hzToScale(freqMax, scale) / hzToScale(freqFrom, scale)
     const rMax1 = Math.min(1, rMax)
 
-    // Create and draw the bitmap - manage async properly
-    const bitmapPromise = createImageBitmap(
-      imageData,
-      0,
+    // Create and draw the bitmap - manage async properly. Only rows inside the frequency range are painted
+    const bitmapPromise = createSpectrogramBitmap(
+      segmentPixels,
+      bitmapHeight,
+      colors,
       Math.round(bitmapHeight * (1 - rMax1)),
-      segmentWidth,
       Math.round(bitmapHeight * (rMax1 - rMin)),
     )
 
-    bitmapPromise
+    return bitmapPromise
       .then((bitmap) => {
         try {
-          // Check if canvas is still valid before drawing
-          if (canvasCtx.canvas.parentNode) {
+          // Skip a canvas that a newer draw, clearCanvases() or destroy() has dropped
+          if (paintingCanvases.has(canvasCtx.canvas)) {
             const drawHeight = (segmentHeight * rMax1) / rMax
             const drawY = yOffset + segmentHeight * (1 - rMax1 / rMax)
 
             canvasCtx.drawImage(bitmap, 0, drawY, canvasWidth, drawHeight)
           }
         } finally {
-          // Clean up bitmap to free memory, even if the canvas was removed before it resolved.
+          // Clean up bitmap to free memory, even if the canvas was dropped before it resolved.
           // The 'close' in bitmap guard is deliberate: some createImageBitmap polyfills (used in
           // older/non-browser environments) don't implement .close() despite lib.dom's ImageBitmap
           // type always declaring it.
@@ -1651,7 +1819,7 @@ export function spectrogramSetup(
       })
       .catch(() => {
         // Nothing to clean up on error - createImageBitmap rejected, so there's no bitmap and
-        // no canvas write to skip.
+        // no canvas write to skip. The canvas is still shown, without this channel.
       })
   }
 
@@ -1660,13 +1828,20 @@ export function spectrogramSetup(
   // reachable via loadFrequenciesData's externally-supplied JSON, see
   // SpectrogramPluginOptions.frequenciesDataUrl. Both shapes are duck-type compatible for the
   // emptiness check below (Uint8Array and Uint8Array[] both have a numeric .length).
-  function drawSpectrogram(input: Uint8Array[][] | Uint8Array[], beforeReady?: () => void): void {
+  //
+  // Returns whether the draw reports ready, running beforeReady with the state version it read and
+  // emitting 'ready' once its canvases are painted and on screen; false when there is nothing to draw.
+  function drawSpectrogram(input: Uint8Array[][] | Uint8Array[], beforeReady?: (version: number) => void): boolean {
     drawVersion = stateVersion
+    const version = drawVersion
     if (!input || input.length === 0 || input.every((channel) => !channel || channel.length === 0)) {
       // Nothing to draw (failed computation, or a buffer too short for a single FFT frame):
-      // remove any previously drawn canvases so no stale spectrogram stays on screen
+      // remove any previously drawn canvases so no stale spectrogram stays on screen. The draws
+      // this one replaced before they were painted are settled now, unless the analysis failed:
+      // they never get on screen, so the failure rejects their requests instead (see render())
+      if (!analysisFailed()) runPendingCompletions()
       clearCanvases()
-      return
+      return false
     }
     // data is 1ch [sample, freq] format -> to [channel, sample, freq] format. The global
     // (coercing) isNaN on input[0][0] discriminates the two shapes: for the flat shape
@@ -1677,18 +1852,29 @@ export function spectrogramSetup(
       ? (input as Uint8Array[][])
       : [input as Uint8Array[]]
 
-    // Clear existing canvases
-    clearCanvases()
+    // The display settings this draw paints with, kept for the canvases it draws later as the view
+    // scrolls. setOptions() replaces the settings at once, but this draw stays on screen until the
+    // next one is painted, after any new analysis, and its later canvases must match its first ones
+    const { height: channelHeight, scale } = settings
+    const colors = colorMap
 
-    // Set the height to fit all channels
-    const totalHeight = settings.height * frequenciesData.length
-    wrapper.style.height = totalHeight + 'px'
+    // The height to fit all channels
+    const totalHeight = channelHeight * frequenciesData.length
 
     const totalWidth = getWidth()
-    const perCanvasWidth = Math.min(maxCanvasWidth, totalWidth)
+    const perCanvasWidth = Math.min(getMaxCanvasWidth(), totalWidth)
 
     // Nothing to render
-    if (totalWidth === 0 || totalHeight === 0) return
+    if (totalWidth === 0 || totalHeight === 0) {
+      wrapper.style.height = totalHeight + 'px'
+      runPendingCompletions()
+      clearCanvases()
+      return false
+    }
+
+    // The current canvases stay on screen until this draw's canvases are painted
+    replaceCanvases()
+    latestWidth = totalWidth
 
     // Calculate number of canvases needed
     const numCanvases = Math.ceil(totalWidth / perCanvasWidth)
@@ -1730,7 +1916,7 @@ export function spectrogramSetup(
 
     // Draw background if needed
     const shouldDrawBackground = freqMax > freqFrom
-    const bgColor = shouldDrawBackground ? colorMap[colorMap.length - 1] : null
+    const bgColor = shouldDrawBackground ? colors[colors.length - 1] : null
 
     // Function to draw a single canvas
     const drawCanvas = (canvasIndex: number) => {
@@ -1745,42 +1931,58 @@ export function spectrogramSetup(
       if (canvasWidth <= 0) return
 
       const canvas = createSingleCanvas(canvasWidth, totalHeight, offset)
+      canvasIndexes.set(canvas, canvasIndex)
       canvases.push(canvas)
+      paintingCanvases.add(canvas)
       const canvasCtx = canvas.getContext('2d')
+      const channelsDrawn: Promise<void>[] = []
 
-      if (!canvasCtx) return
+      if (canvasCtx) {
+        // Draw background if needed
+        if (shouldDrawBackground && bgColor) {
+          canvasCtx.fillStyle = `rgba(${bgColor[0] * 255}, ${bgColor[1] * 255}, ${bgColor[2] * 255}, ${bgColor[3]})`
+          canvasCtx.fillRect(0, 0, canvasWidth, totalHeight)
+        }
 
-      // Draw background if needed
-      if (shouldDrawBackground && bgColor) {
-        canvasCtx.fillStyle = `rgba(${bgColor[0] * 255}, ${bgColor[1] * 255}, ${bgColor[2] * 255}, ${bgColor[3]})`
-        canvasCtx.fillRect(0, 0, canvasWidth, totalHeight)
+        // Render each channel for this canvas segment
+        for (let c = 0; c < resampledData.length; c++) {
+          channelsDrawn.push(
+            drawSpectrogramSegment(
+              resampledData[c],
+              canvasCtx,
+              canvasWidth,
+              channelHeight,
+              c * channelHeight,
+              offset,
+              totalWidth,
+              freqFrom,
+              freqMin,
+              freqMax,
+              scale,
+              colors,
+            ),
+          )
+        }
       }
 
-      // Render each channel for this canvas segment
-      for (let c = 0; c < resampledData.length; c++) {
-        drawSpectrogramSegment(
-          resampledData[c],
-          canvasCtx,
-          canvasWidth,
-          settings.height,
-          c * settings.height,
-          offset,
-          totalWidth,
-          freqFrom,
-          freqMin,
-          freqMax,
-        )
-      }
+      // Shown once every channel is drawn. This always settles asynchronously, so a pass creates
+      // all of its canvases before the first one can be shown
+      Promise.all(channelsDrawn).then(() => showPaintedCanvas(canvas))
     }
 
-    // Store rendering parameters for lazy loading
-    const isScrollable = totalWidth > getWrapperWidth()
+    // Lazy drawing follows the waveform's view. That needs the spectrogram in the waveform's own
+    // wrapper (in a container of its own, nothing scrolls it with the view) and a view narrower than
+    // the spectrogram, where an unknown (0) view width doesn't count. Up to 3 canvases are all drawn
+    const isScrollable =
+      numCanvases > 3 &&
+      wrapper.parentElement === ctx.wavesurfer?.getWrapper() &&
+      totalWidth > (ctx.wavesurfer?.getWidth() || totalWidth)
 
     // Clear previous scroll listener
     scrollUnsubscribe?.()
     scrollUnsubscribe = null
 
-    if (!isScrollable || numCanvases <= 3) {
+    if (!isScrollable) {
       // Draw all canvases if not scrollable or few canvases
       for (let i = 0; i < numCanvases; i++) {
         drawCanvas(i)
@@ -1788,69 +1990,103 @@ export function spectrogramSetup(
     } else {
       // Implement lazy rendering with scroll listener
       const renderVisibleCanvases = () => {
-        const wsWrapper = ctx.wavesurfer?.getWrapper()
-        if (!wsWrapper) return
+        if (!ctx.wavesurfer) return
 
-        const scrollLeft = wsWrapper.scrollLeft || 0
-        const containerWidth = wsWrapper.clientWidth || 0
+        // The view is the waveform's scroll container. getWrapper() is the full-width content
+        // inside it, which never scrolls itself. The view is measured in this draw's pixels: after a
+        // zoom or a resize, this draw's picture can be stretched to the new width until the redraw
+        // for it is shown (see alignPicture). Until it is on screen, take it as stretched
+        const scale = previousCanvases.length === 0 ? shownScale : getWidth() / totalWidth || 1
+        const containerWidth = (ctx.wavesurfer.getWidth() || 0) / scale
+        // Kept within this draw's width: after zooming out, the wider picture this draw replaces can
+        // hold the view past the new end until it is removed, when the view moves back to the end
+        const scrollLeft = Math.min((ctx.wavesurfer.getScroll() || 0) / scale, Math.max(0, totalWidth - containerWidth))
 
         // Calculate visible range with some buffer
         const bufferRatio = 0.5 // Render 50% extra on each side
         const visibleStart = Math.max(0, scrollLeft - containerWidth * bufferRatio)
         const visibleEnd = Math.min(totalWidth, scrollLeft + containerWidth * (1 + bufferRatio))
 
-        const startCanvasIndex = Math.floor((visibleStart / totalWidth) * numCanvases)
-        const endCanvasIndex = Math.min(Math.ceil((visibleEnd / totalWidth) * numCanvases), numCanvases - 1)
+        // Canvas i covers [i * perCanvasWidth, (i + 1) * perCanvasWidth). The last canvas is usually
+        // narrower, so scaling by totalWidth / numCanvases would put the start past a canvas still in
+        // view, and the end a canvas or two past the range
+        const startCanvasIndex = Math.floor(visibleStart / perCanvasWidth)
+        const endCanvasIndex = Math.min(Math.ceil(visibleEnd / perCanvasWidth) - 1, numCanvases - 1)
 
-        // Clear excess canvases if we have too many
-        if (Object.keys(drawnCanvases).length > MAX_NODES) {
-          clearExcessCanvases()
-        }
+        // Make room for the canvases about to be drawn, keeping every canvas in their range
+        clearExcessCanvases(startCanvasIndex, endCanvasIndex)
 
         // Draw visible canvases
         for (let i = startCanvasIndex; i <= endCanvasIndex; i++) {
           drawCanvas(i)
         }
+
+        // Trimming may have removed the only canvases still painting
+        finishReplacement()
       }
 
       // Initial render of visible canvases
       renderVisibleCanvases()
 
-      // Set up scroll listener for lazy loading
-      let cancelScrollTimeout: (() => void) | null = null
+      // Draw as the waveform scrolls, at most once per 16 ms. A scroll event doesn't push back a draw
+      // already due, and the draw reads the scroll position when it runs, so a continuous scroll
+      // (or playback with autoScroll) keeps drawing instead of waiting for the scrolling to stop
+      let cancelScrollRender: (() => void) | null = null
       const onScroll = () => {
-        cancelScrollTimeout?.()
-        cancelScrollTimeout = ctx.scope.timeout(renderVisibleCanvases, 16) // 60fps
+        if (cancelScrollRender) return
+        cancelScrollRender = ctx.scope.timeout(() => {
+          cancelScrollRender = null
+          renderVisibleCanvases()
+        }, 16)
       }
 
-      const wsWrapper = ctx.wavesurfer?.getWrapper()
-      if (wsWrapper) {
-        const removeScrollListener = ctx.scope.listen(wsWrapper, 'scroll', onScroll, { passive: true })
+      if (ctx.wavesurfer) {
+        const removeScrollListener = ctx.scope.add(ctx.wavesurfer.on('scroll', onScroll))
         scrollUnsubscribe = () => {
           removeScrollListener()
-          cancelScrollTimeout?.()
-          cancelScrollTimeout = null
+          cancelScrollRender?.()
+          cancelScrollRender = null
         }
       }
     }
 
-    if (options.labels) {
-      loadLabels(
-        currentOptions.labelsBackground,
-        '12px',
-        '12px',
-        '',
-        currentOptions.labelsColor,
-        currentOptions.labelsHzColor || currentOptions.labelsColor,
-        'center',
-        frequenciesData.length,
-      )
+    // The wrapper's height and the labels fit this draw's picture. With an earlier picture on screen,
+    // they change when this draw's canvases replace it, so that picture is never clipped or mislabelled
+    const showLayout = () => {
+      wrapper.style.height = totalHeight + 'px'
+      if (options.labels) {
+        loadLabels(
+          currentOptions.labelsBackground,
+          '12px',
+          '12px',
+          '',
+          currentOptions.labelsColor,
+          currentOptions.labelsHzColor || currentOptions.labelsColor,
+          'center',
+          frequenciesData.length,
+          { height: channelHeight, frequencyMin: freqMin, frequencyMax: freqMax, scale },
+        )
+      }
     }
+    if (previousCanvases.length > 0) pendingLayout = showLayout
+    else showLayout()
 
-    // Settle the requests this draw shows before listeners run, so their actions only affect
-    // later requests
-    beforeReady?.()
-    ctx.emit('ready')
+    // Ready once this draw's canvases are painted and on screen, so 'ready' listeners and settled
+    // setOptions() calls see the new picture. A draw superseded before then never reports ready,
+    // but what it was to settle is settled with this one, which shows that state or a later one
+    if (beforeReady) pendingCompletions.push(() => beforeReady(version))
+    pendingReady = () => {
+      if (ctx.scope.disposed) return
+      // Settle the requests this draw shows before listeners run, so their actions only affect
+      // later requests
+      runPendingCompletions()
+      ctx.emit('ready')
+      // A display change made while this draw was painting waited for it, as did any made by a
+      // 'ready' listener: either gets a draw of its own now
+      redrawIfChanged(version)
+    }
+    finishReplacement()
+    return true
   }
 
   function loadLabels(
@@ -1862,10 +2098,12 @@ export function spectrogramSetup(
     textColorUnit: string | undefined,
     textAlign: CanvasTextAlign,
     channels: number,
+    // The settings of the picture the labels describe
+    drawn: { height: number; frequencyMin: number; frequencyMax: number; scale: Settings['scale'] },
   ): void {
     if (!labelsEl) return
 
-    const frequenciesHeight = settings.height
+    const frequenciesHeight = drawn.height
     bgFill = bgFill || 'rgba(68,68,68,0)'
     fontSizeFreq = fontSizeFreq || '12px'
     fontSizeUnit = fontSizeUnit || '12px'
@@ -1881,7 +2119,7 @@ export function spectrogramSetup(
     const canvasCtx = labelsEl.getContext('2d')
     if (!canvasCtx) return
     const dispScale = window.devicePixelRatio
-    labelsEl.height = settings.height * channels * dispScale
+    labelsEl.height = drawn.height * channels * dispScale
     labelsEl.width = bgWidth * dispScale
     canvasCtx.scale(dispScale, dispScale)
 
@@ -1898,7 +2136,7 @@ export function spectrogramSetup(
         canvasCtx.textAlign = textAlign
         canvasCtx.textBaseline = 'middle'
 
-        const freq = getLabelFrequency(i, labelIndex, settings.frequencyMin, frequencyMax, settings.scale)
+        const freq = getLabelFrequency(i, labelIndex, drawn.frequencyMin, drawn.frequencyMax, drawn.scale)
         const label = freqType(freq)
         const units = unitType(freq)
         const x = 16
@@ -1990,18 +2228,6 @@ export function spectrogramSetup(
     return frequenciesData.map((channelFreq) => resampleChannel(channelFreq, targetWidth))
   }
 
-  function fillImageDataQuality(
-    data: Uint8ClampedArray,
-    segmentPixels: Uint8Array[],
-    segmentWidth: number,
-    bitmapHeight: number,
-  ): void {
-    // High quality rendering - process all pixels
-    for (let i = 0; i < segmentWidth; i++) {
-      paintColumnPixels(data, segmentPixels[i], colorMap, i, segmentWidth, bitmapHeight)
-    }
-  }
-
   // ---- Wire up to wavesurfer (replaces the pre-port onInit()) ----
   let container: HTMLElement | null = null
   if (options.container) {
@@ -2059,7 +2285,17 @@ export function spectrogramSetup(
       }, 0)
     }
   } else {
-    ctx.scope.add(ctx.wavesurfer.on('redraw', () => throttledRender()))
+    ctx.scope.add(
+      ctx.wavesurfer.on('redraw', () => {
+        // The waveform has its new width already, and wavesurfer then moves the view to keep its
+        // cursor in place. The picture follows once it has, before the next frame, and is redrawn
+        // for the new width after the render throttle
+        Promise.resolve().then(() => {
+          if (!ctx.scope.disposed) alignPicture()
+        })
+        throttledRender()
+      }),
+    )
 
     // Trigger initial render after init. This ensures the spectrogram appears even if no
     // redraw event is fired.
@@ -2134,7 +2370,7 @@ export function spectrogramSetup(
       return drawnCanvases
     },
     get maxCanvasWidth() {
-      return maxCanvasWidth
+      return getMaxCanvasWidth()
     },
     get autoGainBudgetBytes() {
       return autoGainBudgetBytes

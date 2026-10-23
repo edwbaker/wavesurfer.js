@@ -1,6 +1,6 @@
 import Spectrogram from '../plugins/spectrogram.js'
 import WindowedSpectrogram from '../plugins/spectrogram-windowed.js'
-import { paintColumnPixels } from '../spectrogram-render-utils.js'
+import { createColorLookup, paintSpectrogramRows } from '../spectrogram-render-utils.js'
 import { createFakeWaveSurfer } from './helpers/fake-wavesurfer.js'
 import { createFakeAudioBuffer } from './helpers/audio-buffer.js'
 import { mockWorkerInstances, mockWorkerState } from './helpers/spectrogram-worker-mock.js'
@@ -575,29 +575,28 @@ describe('drawSpectrogram zero-frame channels', () => {
   })
 })
 
-describe('paintColumnPixels clamps out-of-range bin values', () => {
-  // fillImageDataQuality (full-mode canvas path) and spectrogram-windowing.ts's
-  // renderChannelToCanvas (windowed-mode canvas path) both delegate to this one shared helper,
-  // so exercising it directly here covers both instead of fighting jsdom's lack of a real 2D
-  // canvas context (getContext('2d') returns null without a canvas-mock package, so the
-  // drawSpectrogram -> ... -> fillImageDataQuality DOM path never actually reaches pixel
-  // painting in this test environment).
-  it('does not throw indexing colorMap for a bin value outside [0, 255], and clamps to the nearest valid color', () => {
+describe('paintSpectrogramRows clamps out-of-range bin values', () => {
+  // The full-mode canvas path (drawSpectrogramSegment) and spectrogram-windowing.ts's
+  // renderChannelToCanvas (windowed-mode canvas path) both paint through this one shared helper
+  // (via createSpectrogramBitmap), so exercising it directly here covers both instead of
+  // fighting jsdom's lack of a real 2D canvas context (getContext('2d') returns null without a
+  // canvas-mock package, so the drawSpectrogram -> ... -> createSpectrogramBitmap DOM path never
+  // actually reaches pixel painting in this test environment).
+  it('does not throw for a bin value outside [0, 255], and clamps to the nearest valid color', () => {
     // Every internally-computed segment's bin values come from a Uint8Array (already 0-255),
     // but loadFrequenciesData's externally-supplied JSON (frequenciesDataUrl) is only assumed,
     // never runtime-validated, to already be in range - see frequenciesDataUrl's own doc
-    // comment. An out-of-range value must clamp to the nearest valid color instead of indexing
-    // colorMap out of bounds and throwing on `color[0]` off `undefined`.
-    const colorMap: number[][] = Array.from({ length: 256 }, (_, i) => [i / 255, 0, 0, 1])
+    // comment. An out-of-range value must clamp to the nearest valid color.
+    const colors = createColorLookup(Array.from({ length: 256 }, (_, i) => [i / 255, 0, 0, 1]))
     const data = new Uint8ClampedArray(4 * 5) // 1 column, 5 rows, RGBA
     const column = [300, -5, 128, 0, 255]
 
-    expect(() => paintColumnPixels(data, column, colorMap, 0, 1, 5)).not.toThrow()
+    expect(() => paintSpectrogramRows(data, [column], colors, 5, 0, 5)).not.toThrow()
 
-    // row 0 (value 300, clamps to 255 -> colorMap[255] = [1, 0, 0, 1]) lands at the BOTTOM
-    // pixel row ((rowCount - row - 1) * columnCount + columnIndex) * 4 = (5-0-1)*1*4 = 16
+    // bin 0 (value 300, clamps to 255 -> colorMap[255] = [1, 0, 0, 1]) lands at the BOTTOM
+    // pixel row, byte (binCount - bin - 1) * columns * 4 = (5-0-1)*1*4 = 16
     expect(data[16]).toBe(255)
-    // row 1 (value -5, clamps to 0 -> colorMap[0] = [0, 0, 0, 1]) at pixelIndex (5-1-1)*4 = 12
+    // bin 1 (value -5, clamps to 0 -> colorMap[0] = [0, 0, 0, 1]) at byte (5-1-1)*4 = 12
     expect(data[12]).toBe(0)
   })
 })

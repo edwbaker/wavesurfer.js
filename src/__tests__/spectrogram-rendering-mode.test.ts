@@ -249,7 +249,7 @@ describe('a rejected fire-and-forget render routes to the plugin error event', (
       const internals = plugin.__spectrogramInternalsForTests().windowed
       jest.spyOn(internals.segmentManager, 'renderVisibleWindow').mockRejectedValue(new Error('segment boom'))
 
-      // scheduleWindowedRender's registered 'timeupdate' listener debounces via a 16ms timer.
+      // scheduleWindowedRender's registered 'timeupdate' listener draws from a 16ms timer.
       ;(fakeWavesurfer as any).emit('timeupdate')
       jest.advanceTimersByTime(16)
       await Promise.resolve()

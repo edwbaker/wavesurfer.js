@@ -5,17 +5,21 @@ import { createEmitter } from './helpers/create-emitter.js'
 import { mockWorkerInstances, mockWorkerState } from './helpers/spectrogram-worker-mock.js'
 
 // The worker mock answers with whatever a test passes, so the audio content never matters. With
-// 16 bins and a linear scale, the bitmap crop passed to createImageBitmap shows the drawn
-// frequency range directly: on 8 kHz audio each bin is 250 Hz.
+// 16 bins and a linear scale, the bitmap crop shows the drawn frequency range directly: on 8 kHz
+// audio each bin is 250 Hz.
 const BINS = 16
 const FRAMES = 8
+
+// The red channel is the color index, so a painted pixel shows the bin value it was painted from
+const INDEX_COLORS = Array.from({ length: 256 }, (_, i) => [i / 255, 0, 0, 1])
 
 function makeBuffer(sampleRate = 8000): AudioBuffer {
   return createFakeAudioBuffer(new Float32Array(4096), { sampleRate })
 }
 
-function makeFrequencies(value = 100): Uint8Array[][] {
-  return [Array.from({ length: FRAMES }, () => new Uint8Array(BINS).fill(value))]
+/** Every bin holds `value`, or by default its own index, which lastCrop() reads back */
+function makeFrequencies(value?: number): Uint8Array[][] {
+  return [Array.from({ length: FRAMES }, () => Uint8Array.from({ length: BINS }, (_, bin) => value ?? bin))]
 }
 
 type Posted = { worker: any; id: string; options: Record<string, unknown> }
@@ -128,7 +132,7 @@ function createPlugin(
   Object.defineProperty(wrapper, 'offsetWidth', { value: width })
   Object.defineProperty(wrapper, 'clientWidth', { value: width })
 
-  const plugin: any = Spectrogram.create({ useWebWorker: true, scale: 'linear', ...options })
+  const plugin: any = Spectrogram.create({ useWebWorker: true, scale: 'linear', colorMap: INDEX_COLORS, ...options })
   const events = { ready: jest.fn(), error: jest.fn() }
   plugin.on('ready', events.ready)
   plugin.on('error', events.error)
@@ -156,11 +160,13 @@ async function firstDraw(result = makeFrequencies()): Promise<void> {
   await flush()
 }
 
-/** [y, height] of the source rectangle of the latest bitmap crop */
+/** [y, height] of the latest bitmap crop, in rows of the whole spectrogram image */
 function lastCrop(): number[] {
-  const calls = createImageBitmapMock.mock.calls as unknown[][]
-  const call = calls[calls.length - 1]
-  return [call[2] as number, call[4] as number]
+  const calls = createImageBitmapMock.mock.calls as any[][]
+  const [image, , y, , height] = calls[calls.length - 1]
+  // Only the rows inside the crop are painted: the image's top row is the bin its first pixel
+  // shows, and y is relative to that row
+  return [BINS - 1 - image.data[0] + y, height]
 }
 
 /** The text of the latest frequency label drawn, the top one (labels need height 256 for that) */
@@ -214,6 +220,25 @@ describe('SpectrogramPlugin setOptions in full rendering mode', () => {
     expect(h.internals.canvases[0].style.height).toBe('250px')
     // 1000-3000 Hz of a 0-4000 Hz band: bins 4 to 12 counted from the top
     expect(lastCrop()).toEqual([4, 8])
+  })
+
+  it('paints only the rows of a narrowed frequency range, the same as those rows of the whole image', async () => {
+    const h = createPlugin()
+    await firstDraw()
+    const calls = createImageBitmapMock.mock.calls as any[][]
+    const whole = calls[calls.length - 1][0]
+    expect(whole.height).toBe(BINS)
+
+    track(h.plugin.setOptions({ frequencyMin: 1000, frequencyMax: 3000 }))
+    nextFrame()
+    await flush()
+
+    // 1000-3000 Hz of a 0-4000 Hz band: rows 4 to 12 of the whole image
+    const [band, x, y, width, height] = calls[calls.length - 1]
+    expect([x, y, width, height]).toEqual([0, 0, whole.width, 8])
+    expect(band.height).toBe(8)
+    const rowBytes = whole.width * 4
+    expect(Array.from(band.data)).toEqual(Array.from(whole.data.subarray(4 * rowBytes, 12 * rowBytes)))
   })
 
   it('redraws a color map change from the retained data, without a new analysis', async () => {
@@ -447,6 +472,38 @@ describe('SpectrogramPlugin setOptions in full rendering mode', () => {
       expect(h.events.error).toHaveBeenCalledTimes(1)
       expect(analysis.state).toBe('rejected')
       expect(analysis.error.message).toBe('Worker timeout')
+    })
+
+    it('rejects a display change whose redraw a failed analysis replaces before it is painted', async () => {
+      const h = createPlugin({ fallbackToMainThread: false })
+      await firstDraw()
+      // From here bitmaps are held, so the display redraw is still being painted when the analysis fails
+      const held: Array<() => void> = []
+      createImageBitmapMock.mockImplementation(
+        () => new Promise((resolve) => held.push(() => resolve({ close: jest.fn() }))),
+      )
+
+      const display = track(h.plugin.setOptions({ height: 300 }))
+      nextFrame()
+      await flush()
+      expect(held.length).toBeGreaterThan(0)
+
+      const analysis = track(h.plugin.setOptions({ fftSamples: 1024 }))
+      jest.advanceTimersByTime(50)
+      failRequest(lastPosted(), 'worker failed')
+      await flush()
+
+      // The redraw is never shown, so the failure rejects its display change too
+      expect(h.events.error).toHaveBeenCalledTimes(1)
+      const error = h.events.error.mock.calls[0][0]
+      expect(display.state).toBe('rejected')
+      expect(display.error).toBe(error)
+      expect(analysis.error).toBe(error)
+
+      held.splice(0).forEach((deliver) => deliver())
+      await flush()
+      expect(h.internals.canvasContainer.querySelectorAll('canvas')).toHaveLength(0)
+      expect(h.events.ready).toHaveBeenCalledTimes(1)
     })
   })
 

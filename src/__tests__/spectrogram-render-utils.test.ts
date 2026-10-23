@@ -13,7 +13,13 @@ import {
   barkToHz,
   hzToScale,
   scaleToHz,
+  setupColorMap,
+  createColorLookup,
+  paintSpectrogramRows,
   paintColumnPixels,
+  createSpectrogramBitmap,
+  getCanvasPixelRatio,
+  getDefaultMaxCanvasWidth,
 } from '../spectrogram-render-utils.js'
 
 const SCALES = ['mel', 'logarithmic', 'bark', 'erb'] as const
@@ -397,23 +403,345 @@ describe('bark scale zero normalization', () => {
   })
 })
 
-describe('paintColumnPixels floors fractional bin values', () => {
+describe('paintSpectrogramRows floors fractional bin values', () => {
   // Internally computed columns are Uint8Array entries (integers 0-255), but
   // loadFrequenciesData's externally-supplied frequenciesDataUrl JSON can carry fractional
-  // numbers; a fractional index like colorMap[12.7] is undefined and throws mid-draw on
-  // `color[0]`. Values must be floored after clamping.
-  it('does not throw indexing colorMap for fractional values, flooring after the clamp', () => {
-    const colorMap: number[][] = Array.from({ length: 256 }, (_, i) => [i / 255, 0, 0, 1])
+  // numbers, which index no color. Values must be floored after clamping.
+  it('does not throw for fractional values, flooring after the clamp', () => {
+    const colors = createColorLookup(Array.from({ length: 256 }, (_, i) => [i / 255, 0, 0, 1]))
     const data = new Uint8ClampedArray(4 * 3) // 1 column, 3 rows, RGBA
     const column = [12.7, 254.5, 300.9]
 
-    expect(() => paintColumnPixels(data, column, colorMap, 0, 1, 3)).not.toThrow()
+    expect(() => paintSpectrogramRows(data, [column], colors, 3, 0, 3)).not.toThrow()
 
-    // row 0 (12.7 -> floor 12) lands at the BOTTOM pixel row: ((3 - 0 - 1) * 1 + 0) * 4 = 8
+    // bin 0 (12.7 -> floor 12) lands at the BOTTOM pixel row: byte (3 - 0 - 1) * 4 = 8
     expect(data[8]).toBe(12)
-    // row 1 (254.5 -> floor 254) at pixelIndex (3 - 1 - 1) * 4 = 4
+    // bin 1 (254.5 -> floor 254) at byte (3 - 1 - 1) * 4 = 4
     expect(data[4]).toBe(254)
-    // row 2 (300.9 -> clamps to 255 first, floor is a no-op) at pixelIndex 0
+    // bin 2 (300.9 -> clamps to 255 first, floor is a no-op) at byte 0
     expect(data[0]).toBe(255)
+  })
+})
+
+describe('applySparseFilterBank output buffers', () => {
+  const filterBank = [
+    // lo = -1 has no lower tap, so that tap must contribute nothing rather than a stale value
+    { lo: -1, weightLo: 0.25, weightHi: 0.75, centerHz: 0 },
+    { lo: 1, weightLo: 0.5, weightHi: 0.5, centerHz: 0 },
+  ]
+  const points = Float32Array.from([1, 2, 3, 4])
+
+  it('writes into a supplied buffer and returns that buffer', () => {
+    const out = new Float32Array(2)
+    const result = applySparseFilterBank(points, filterBank, out)
+
+    expect(result).toBe(out)
+    expect(Array.from(result)).toEqual([0.75, 2.5])
+  })
+
+  it('does not keep a value from an earlier frame in a reused buffer', () => {
+    const out = new Float32Array(2).fill(99)
+
+    expect(Array.from(applySparseFilterBank(points, filterBank, out))).toEqual([0.75, 2.5])
+  })
+
+  it('ignores a supplied buffer of the wrong length', () => {
+    const wrong = new Float32Array(5)
+
+    const result = applySparseFilterBank(points, filterBank, wrong)
+
+    expect(result).not.toBe(wrong)
+    expect(Array.from(result)).toEqual([0.75, 2.5])
+  })
+})
+
+// The per-pixel painter that paintSpectrogramRows replaced, kept as the reference it must match
+function paintColumnPixelsBefore(
+  data: Uint8ClampedArray,
+  column: ArrayLike<number>,
+  colorMap: number[][],
+  columnIndex: number,
+  columnCount: number,
+  rowCount: number,
+): void {
+  for (let row = 0; row < rowCount; row++) {
+    const colorIndex = Math.floor(Math.min(255, Math.max(0, column[row])))
+    const color = colorMap[colorIndex]
+    const pixelIndex = ((rowCount - row - 1) * columnCount + columnIndex) * 4
+    data[pixelIndex] = color[0] * 255
+    data[pixelIndex + 1] = color[1] * 255
+    data[pixelIndex + 2] = color[2] * 255
+    data[pixelIndex + 3] = color[3] * 255
+  }
+}
+
+/** The whole image (every bin), as the replaced painter drew it */
+function paintImageBefore(columns: ArrayLike<number>[], colorMap: number[][], binCount: number): Uint8ClampedArray {
+  const data = new Uint8ClampedArray(columns.length * binCount * 4)
+  columns.forEach((column, i) => paintColumnPixelsBefore(data, column, colorMap, i, columns.length, binCount))
+  return data
+}
+
+/** Deterministic pseudo-random numbers in [0, 1) */
+function makeRandom(seed: number): () => number {
+  let state = seed
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0
+    return state / 2 ** 32
+  }
+}
+
+describe('paintSpectrogramRows matches the per-pixel painter it replaced', () => {
+  const BINS = 37
+  const WIDTH = 23
+  const random = makeRandom(7)
+
+  const colorMaps: Record<string, number[][]> = {
+    roseus: setupColorMap('roseus'),
+    gray: setupColorMap('gray'),
+    igray: setupColorMap('igray'),
+    // Channels that land halfway between two bytes, outside 0-1, or on NaN, which the
+    // Uint8ClampedArray stores round to even, clamp, or zero
+    awkward: Array.from({ length: 256 }, (_, i) => [
+      (i + 0.5) / 255,
+      i % 17 === 0 ? NaN : (i * 7) % 300,
+      1.2 - i / 200,
+      ((i % 5) - 1) / 3,
+    ]),
+    // More than 256 entries: only the first 256 are reachable
+    long: Array.from({ length: 300 }, () => [random(), random(), random(), random()]),
+  }
+
+  const uint8Columns = Array.from({ length: WIDTH }, () =>
+    Uint8Array.from({ length: BINS }, () => Math.floor(random() * 256)),
+  )
+  // Plain arrays, as frequenciesDataUrl JSON delivers them: fractional, out-of-range and
+  // non-number values that the old painter clamped, floored or coerced
+  const odd = [0, 255, 12.7, 254.5, 254.99, 255.5, 300.9, -0.5, -5, 1e9, -1e9, Infinity, -Infinity, 0.999]
+  const json = [null, true, false, '12.7', '300'] as unknown as number[]
+  const plainColumns = Array.from({ length: WIDTH }, (_, x) =>
+    Array.from({ length: BINS }, (_, bin) => {
+      if ((bin + x) % 5 === 0) return json[(bin + x) % json.length]
+      if ((bin + x) % 3 === 0) return odd[(bin + x) % odd.length]
+      return random() * 400 - 70
+    }),
+  )
+
+  for (const [name, colorMap] of Object.entries(colorMaps)) {
+    it(`paints the same bytes with the ${name} color map`, () => {
+      const colors = createColorLookup(colorMap)
+      for (const columns of [uint8Columns, plainColumns]) {
+        const data = new Uint8ClampedArray(WIDTH * BINS * 4)
+        paintSpectrogramRows(data, columns, colors, BINS, 0, BINS)
+        expect(data).toEqual(paintImageBefore(columns, colorMap, BINS))
+      }
+    })
+  }
+
+  it('paints a band of rows the same as those rows of the whole image', () => {
+    const colorMap = colorMaps.roseus
+    const colors = createColorLookup(colorMap)
+    const rowBytes = WIDTH * 4
+    for (const columns of [uint8Columns, plainColumns]) {
+      const whole = paintImageBefore(columns, colorMap, BINS)
+      for (const [firstRow, rowCount] of [
+        [0, 1],
+        [0, 20],
+        [5, 9],
+        [36, 1],
+        [17, 20],
+      ]) {
+        const data = new Uint8ClampedArray(rowBytes * rowCount)
+        paintSpectrogramRows(data, columns, colors, BINS, firstRow, rowCount)
+        expect(data).toEqual(whole.slice(firstRow * rowBytes, (firstRow + rowCount) * rowBytes))
+      }
+    }
+  })
+
+  it('packs each color as its RGBA bytes, rounded like the per-pixel stores', () => {
+    const colorMap = colorMaps.awkward
+    const bytes = new Uint8Array(createColorLookup(colorMap).buffer)
+    const expected = new Uint8ClampedArray(256 * 4)
+    colorMap.forEach((color, i) => color.forEach((channel, k) => (expected[i * 4 + k] = channel * 255)))
+    expect(Array.from(bytes)).toEqual(Array.from(expected))
+  })
+
+  it('paints a value that is not a number with color 0, where the per-pixel painter threw', () => {
+    const colorMap = colorMaps.roseus
+    const color0 = Array.from(new Uint8Array(createColorLookup(colorMap).buffer, 0, 4))
+    const data = new Uint8ClampedArray(4 * 3)
+    // NaN, a non-numeric string, and a value missing from a short column
+    const column = [NaN, 'x' as unknown as number]
+
+    paintSpectrogramRows(data, [column], createColorLookup(colorMap), 3, 0, 3)
+
+    expect(Array.from(data)).toEqual([...color0, ...color0, ...color0])
+    expect(() => paintImageBefore([column], colorMap, 3)).toThrow(TypeError)
+  })
+
+  describe('the deprecated paintColumnPixels, kept on top of it', () => {
+    for (const [name, colorMap] of Object.entries(colorMaps)) {
+      it(`paints each column into its place like before, with the ${name} color map`, () => {
+        for (const columns of [uint8Columns, plainColumns]) {
+          // A fresh image per column, so a pixel painted outside the column would show
+          const mismatched = columns.flatMap((column, x) => {
+            const data = new Uint8ClampedArray(WIDTH * BINS * 4)
+            const before = new Uint8ClampedArray(WIDTH * BINS * 4)
+            paintColumnPixels(data, column, colorMap, x, WIDTH, BINS)
+            paintColumnPixelsBefore(before, column, colorMap, x, WIDTH, BINS)
+            return data.some((byte, i) => byte !== before[i]) ? [x] : []
+          })
+          expect(mismatched).toEqual([])
+        }
+      })
+    }
+
+    it('paints a value that is not a number with color 0, like paintSpectrogramRows', () => {
+      const colorMap = colorMaps.roseus
+      const color0 = Array.from(new Uint8Array(createColorLookup(colorMap).buffer, 0, 4))
+      const data = new Uint8ClampedArray(4 * 3)
+
+      paintColumnPixels(data, [NaN, 'x' as unknown as number], colorMap, 0, 1, 3)
+
+      expect(Array.from(data)).toEqual([...color0, ...color0, ...color0])
+    })
+  })
+})
+
+describe('createSpectrogramBitmap', () => {
+  const originalImageData = (globalThis as any).ImageData
+  const originalCreateImageBitmap = (globalThis as any).createImageBitmap
+  let createImageBitmapMock: jest.Mock
+
+  beforeEach(() => {
+    // jsdom has neither ImageData nor createImageBitmap
+    ;(globalThis as any).ImageData = class {
+      data: Uint8ClampedArray
+      constructor(
+        public width: number,
+        public height: number,
+      ) {
+        this.data = new Uint8ClampedArray(width * height * 4)
+      }
+    }
+    createImageBitmapMock = jest.fn(() => Promise.resolve({}))
+    ;(globalThis as any).createImageBitmap = createImageBitmapMock
+  })
+
+  afterEach(() => {
+    ;(globalThis as any).ImageData = originalImageData
+    ;(globalThis as any).createImageBitmap = originalCreateImageBitmap
+  })
+
+  type Image = { width: number; height: number; data: Uint8ClampedArray }
+  /** createImageBitmap(image, sx, sy, sw, sh) */
+  type BitmapCall = [Image, number, number, number, number]
+
+  /**
+   * The pixels of createImageBitmap(image, 0, y, image.width, height): the rectangle with
+   * corners (0, y) and (image.width, y + height), so a negative height extends up from y, and
+   * its rows outside the image transparent. null for a zero height, which rejects.
+   */
+  function crop(image: Image, y: number, height: number): Uint8ClampedArray | null {
+    if (height === 0) return null
+    const rowBytes = image.width * 4
+    const top = Math.min(y, y + height)
+    const out = new Uint8ClampedArray(Math.abs(height) * rowBytes)
+    for (let row = 0; row < Math.abs(height); row++) {
+      const source = top + row
+      if (source >= 0 && source < image.height) {
+        out.set(image.data.subarray(source * rowBytes, (source + 1) * rowBytes), row * rowBytes)
+      }
+    }
+    return out
+  }
+
+  const BINS = 16
+  const WIDTH = 9
+  const colorMap = setupColorMap('roseus')
+  const columns = Array.from({ length: WIDTH }, (_, x) =>
+    Uint8Array.from({ length: BINS }, (_, bin) => (x * 31 + bin * 17) % 256),
+  )
+  const whole: Image = { width: WIDTH, height: BINS, data: paintImageBefore(columns, colorMap, BINS) }
+
+  // [sourceY, sourceHeight, image rows inside the rectangle]: the whole image, narrowed
+  // frequency ranges, rectangles reaching past either edge, negative heights, and rectangles
+  // entirely outside the image
+  const rectangles = [
+    [0, 16, 16],
+    [4, 8, 8],
+    [0, 1, 1],
+    [15, 1, 1],
+    [12, 6, 4],
+    [-3, 7, 4],
+    [-2, 20, 16],
+    [10, -4, 4],
+    [3, -6, 3],
+    [16, 2, 0],
+    [-5, 3, 0],
+    [0, -2, 0],
+  ]
+
+  for (const [sourceY, sourceHeight, rowsInside] of rectangles) {
+    it(`makes the bitmap of the whole image cropped to y ${sourceY}, height ${sourceHeight}`, async () => {
+      await createSpectrogramBitmap(columns, BINS, colorMap, sourceY, sourceHeight)
+
+      const [image, x, y, width, height] = createImageBitmapMock.mock.calls[0] as BitmapCall
+      expect([x, width, height]).toEqual([0, WIDTH, sourceHeight])
+      expect(crop(image, y, height)).toEqual(crop(whole, sourceY, sourceHeight))
+      // Only the rows inside the rectangle are painted (an ImageData has at least one row)
+      expect(image.height).toBe(Math.max(1, rowsInside))
+    })
+  }
+
+  it('passes a zero height on, so createImageBitmap rejects it as it did the whole image', async () => {
+    // createImageBitmap reads NaN and infinite numbers as 0
+    for (const [sourceY, sourceHeight] of [
+      [5, 0],
+      [NaN, NaN],
+      [0, Infinity],
+      [Infinity, -Infinity],
+    ]) {
+      createImageBitmapMock.mockClear()
+      await createSpectrogramBitmap(columns, BINS, colorMap, sourceY, sourceHeight)
+      const [, , , , height] = createImageBitmapMock.mock.calls[0] as BitmapCall
+      expect(height).toBe(0)
+    }
+  })
+})
+
+describe('getDefaultMaxCanvasWidth', () => {
+  const originalDpr = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio')
+  const setPixelRatio = (value: number) =>
+    Object.defineProperty(window, 'devicePixelRatio', { value, configurable: true })
+
+  afterEach(() => {
+    if (originalDpr) {
+      Object.defineProperty(window, 'devicePixelRatio', originalDpr)
+    } else {
+      delete (window as any).devicePixelRatio
+    }
+  })
+
+  it('is 4,096 px up to a pixel ratio of 2, and above that keeps the backing store within 8,192 px', () => {
+    for (const [pixelRatio, width] of [
+      [0.5, 4096],
+      [1, 4096],
+      [1.5, 4096],
+      [2, 4096],
+      [2.25, 3640],
+      [3, 2730],
+      [4, 2048],
+    ]) {
+      setPixelRatio(pixelRatio)
+      expect(getDefaultMaxCanvasWidth()).toBe(width)
+      // The backing store createSingleCanvas makes for a canvas that wide, 200 px tall
+      expect(Math.round(width * getCanvasPixelRatio(width, 200))).toBeLessThanOrEqual(8192)
+    }
+  })
+
+  it('treats a missing pixel ratio as 1', () => {
+    setPixelRatio(0)
+    expect(getDefaultMaxCanvasWidth()).toBe(4096)
   })
 })
