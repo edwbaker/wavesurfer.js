@@ -66,7 +66,7 @@ afterEach(() => {
 
 function createPlugin(
   options: Record<string, unknown> = {},
-  { width = 600, clientWidth = 600, decoded = null as AudioBuffer | null } = {},
+  { width = 600, clientWidth = 600, decoded = null as AudioBuffer | null, fillParent = false } = {},
 ) {
   const emitter = createEmitter()
   const wrapper = document.createElement('div')
@@ -79,6 +79,7 @@ function createPlugin(
   const plugin: any = SpectrogramPlugin.create({ scale: 'linear', ...options })
   plugin._init(
     createFakeWaveSurfer({
+      options: { fillParent },
       on: emitter.on,
       getWrapper: () => wrapper,
       getDecodedData: () => decoded,
@@ -483,6 +484,49 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     await done
     expectShown(h, [next])
     expect(topLabel()).toBe('2.0')
+  })
+
+  it('stretches the picture on screen to a new width until the redraw for it replaces it', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    // Five 2000px canvases in a 600px view at the end, with wavesurfer's default fillParent: canvas 4
+    const h = createPlugin({ maxCanvasWidth: 2000 }, { width: 10000, clientWidth: 600, decoded, fillParent: true })
+    h.view.scrollLeft = 9400
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+    const container: HTMLElement = h.internals.canvasContainer
+    expect((container.parentElement as HTMLElement).style.overflowX).toBe('hidden')
+    const previous = h.internals.canvases.slice()
+    expect(previous.map((canvas: HTMLCanvasElement) => canvas.style.left)).toEqual(['8000px'])
+
+    // Zoomed out to 5000px: the waveform is redrawn at once, and the view moves back within it, to
+    // 4400 to 5000px. The wrapper clips everything past 5000px, the canvas at 8000 to 10000px
+    // included: stretched to the new width, that canvas shows at 4000 to 5000px instead, in view
+    h.size.width = 5000
+    h.view.scrollLeft = 4400
+    h.emitter.emit('redraw')
+    expect(container.style.transform).toBe('scaleX(0.5)')
+    expectShown(h, previous)
+
+    // Until it is replaced, it draws around the view in its own pixels, 8200 to 10000px there,
+    // which canvas 4 already covers
+    const createImageBitmap = (globalThis as any).createImageBitmap as jest.Mock
+    const requested = createImageBitmap.mock.calls.length
+    h.emitter.emit('scroll')
+    jest.advanceTimersByTime(16)
+    expect(createImageBitmap.mock.calls.length).toBe(requested)
+
+    // The redraw for 5000px is held until its bitmaps are drawn, then replaces it unstretched
+    jest.advanceTimersByTime(50)
+    const next = h.internals.canvases.slice()
+    expect(next.length).toBeGreaterThan(0)
+    expectShown(h, previous)
+    expect(container.style.transform).toBe('scaleX(0.5)')
+
+    await deliver()
+    expectShown(h, next)
+    expect(container.style.transform).toBe('')
   })
 
   it('puts a redraw on screen when trimming removes the only canvas still painting', async () => {
