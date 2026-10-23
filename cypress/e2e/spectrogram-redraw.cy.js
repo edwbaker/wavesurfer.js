@@ -197,6 +197,32 @@ describe('Spectrogram full-mode redraws', () => {
     })
   })
 
+  it('keeps the view painted when zooming from lazy drawing back to fit', () => {
+    // Drawn lazily, the picture has a canvas only around the view: shrunk to fit it would cover a
+    // fifth of the view, so it stays as drawn until the redraw replaces it
+    open()
+    zoomTo(LAZY_ZOOM)
+    shouldShowTheView()
+
+    startWatching({ coverage: true })
+    zoomTo(0)
+    shouldShowTheView()
+    expectNothingWrongSeen()
+  })
+
+  it('keeps the view painted when zooming out around the cursor', () => {
+    // A seek brings the cursor to the middle of the view, which a zoom then moves to keep the cursor
+    // in place. The picture is shown for the view the zoom moves to
+    open({}, { minPxPerSec: WIDE_ZOOM })
+    cy.window().then((win) => win.wavesurfer.setTime(win.wavesurfer.getDuration() / 2))
+    shouldShowTheView()
+
+    startWatching({ coverage: true })
+    zoomTo(LAZY_ZOOM)
+    shouldShowTheView()
+    expectNothingWrongSeen()
+  })
+
   it('settles setOptions() once the new picture is on screen, without clipping the old one', () => {
     open()
     startWatching()
