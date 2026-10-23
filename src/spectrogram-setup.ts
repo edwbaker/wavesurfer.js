@@ -1273,7 +1273,9 @@ export function spectrogramSetup(
     // produce plain number arrays (never real Uint8Array instances), but every consumer below
     // only relies on indexing/length/iteration, which plain arrays support identically. Not
     // runtime-validated, matching the pre-port behavior.
-    return drawSpectrogram(data as Uint8Array[][], beforeReady)
+    const readyPending = drawSpectrogram(data as Uint8Array[][], beforeReady)
+    if (!readyPending) beforeReady?.(drawVersion)
+    return readyPending
   }
 
   async function getFrequenciesData(): Promise<Uint8Array[][] | null> {
