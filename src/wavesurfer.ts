@@ -737,40 +737,65 @@ class WaveSurfer extends EventEmitter<WaveSurferEvents> {
       // Guard: bail if a newer load started or the instance was destroyed
       if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
 
-      // Set the mediaelement source
-      this.player.setSrc(url, blob)
-
-      // Wait for the audio duration
-      const audioDuration = await new Promise<number>((resolve) => {
-        const staticDuration = duration || this.getDuration()
-        if (staticDuration) {
-          resolve(staticDuration)
-        } else {
-          this.mediaEventScope.add(
-            this.player.onMediaEvent('loadedmetadata', () => resolve(this.getDuration()), { once: true }),
-          )
-          // Settle if the media-event bridge is torn down before
-          // 'loadedmetadata' ever fires: setMediaElement() disposes
-          // mediaEventScope (killing the listener above) WITHOUT disposing
-          // loadScope, so without this hook the promise -- and thus
-          // loadAudio()/load() -- would hang forever; the load then continues
-          // against the new media with an unknown (0) duration, and the
-          // decode step recovers the real duration where possible.
-          const settleOnBridgeTeardown = this.mediaEventScope.add(() => resolve(0))
-          // Also settle if this load is superseded or the instance is
-          // destroyed before 'loadedmetadata' ever fires (e.g. never emitted
-          // by the test/media environment). Running settleOnBridgeTeardown
-          // here both resolves the promise and deregisters the bridge hook
-          // above, so completed loads don't accumulate stale disposers on
-          // mediaEventScope. Late registration on an already-disposed scope
-          // runs immediately (see Scope.add), so this is safe even if
-          // loadScope somehow disposes synchronously before this line runs.
-          // The resolved value is discarded either way: the very next
-          // `if (loadScope.disposed) return` bails before audioDuration is
-          // used.
-          loadScope.add(settleOnBridgeTeardown)
+      // Under the WebAudio backend the file is decoded once, here, and that buffer is played. The waveform is resampled
+      // from it below, rather than the file being decoded a second time. Without OfflineAudioContext the player
+      // decodes the source itself, as before.
+      let playbackBuffer: AudioBuffer | null = null
+      if (this.webAudioPlayer && blob && !channelData && Decoder.canResample()) {
+        if (!loadScope.disposed) {
+          this.wavesurferActions.setLoadPhase('decoding')
         }
-      })
+        // Read the blob before decoding it, so a load cancelled during the read never starts a decode
+        const arrayBuffer = await blob.arrayBuffer()
+        // Guard: bail if a newer load started or the instance was destroyed
+        if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
+        playbackBuffer = await Decoder.decode(arrayBuffer)
+        // Guard: bail if a newer load started or the instance was destroyed
+        if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
+      }
+      // The media can have been replaced by an HTML element while the file was decoding. The buffer is then not played,
+      // and the load takes the regular source path.
+      if (playbackBuffer && this.webAudioPlayer && blob) {
+        this.player.setDecodedSrc(blob, playbackBuffer)
+      } else {
+        playbackBuffer = null
+        // Set the mediaelement source
+        this.player.setSrc(url, blob)
+      }
+
+      // Wait for the audio duration. A decoded buffer already has it, and its 'loadedmetadata' has fired.
+      const audioDuration = playbackBuffer
+        ? playbackBuffer.duration
+        : await new Promise<number>((resolve) => {
+            const staticDuration = duration || this.getDuration()
+            if (staticDuration) {
+              resolve(staticDuration)
+            } else {
+              this.mediaEventScope.add(
+                this.player.onMediaEvent('loadedmetadata', () => resolve(this.getDuration()), { once: true }),
+              )
+              // Settle if the media-event bridge is torn down before
+              // 'loadedmetadata' ever fires: setMediaElement() disposes
+              // mediaEventScope (killing the listener above) WITHOUT disposing
+              // loadScope, so without this hook the promise -- and thus
+              // loadAudio()/load() -- would hang forever; the load then continues
+              // against the new media with an unknown (0) duration, and the
+              // decode step recovers the real duration where possible.
+              const settleOnBridgeTeardown = this.mediaEventScope.add(() => resolve(0))
+              // Also settle if this load is superseded or the instance is
+              // destroyed before 'loadedmetadata' ever fires (e.g. never emitted
+              // by the test/media environment). Running settleOnBridgeTeardown
+              // here both resolves the promise and deregisters the bridge hook
+              // above, so completed loads don't accumulate stale disposers on
+              // mediaEventScope. Late registration on an already-disposed scope
+              // runs immediately (see Scope.add), so this is safe even if
+              // loadScope somehow disposes synchronously before this line runs.
+              // The resolved value is discarded either way: the very next
+              // `if (loadScope.disposed) return` bails before audioDuration is
+              // used.
+              loadScope.add(settleOnBridgeTeardown)
+            }
+          })
 
       // Guard: bail if a newer load started or the instance was destroyed
       if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
@@ -787,6 +812,12 @@ class WaveSurfer extends EventEmitter<WaveSurferEvents> {
       // Decode the audio data or use user-provided peaks
       if (channelData) {
         this.decodedData = Decoder.createBuffer(channelData, audioDuration || 0)
+      } else if (playbackBuffer) {
+        // Resampled from the buffer that is playing: the file was decoded once
+        const resampled = await Decoder.resample(playbackBuffer, this.options.sampleRate)
+        // Guard: bail if a newer load started or the instance was destroyed
+        if (loadScope.disposed) return this.bailedLoadOutcome(loadScope)
+        this.decodedData = resampled
       } else if (blob) {
         const arrayBuffer = await blob.arrayBuffer()
         // Guard: bail if a newer load started or the instance was destroyed
@@ -1080,7 +1111,11 @@ class WaveSurfer extends EventEmitter<WaveSurferEvents> {
     this.load('', [[0]], 0.001).catch(() => undefined)
   }
 
-  /** Set HTML media element */
+  /**
+   * Set the media element that plays the audio. This can be called while a load is in progress. The load then finishes
+   * with the element that is current when it reaches its source step: a file that was decoded for WebAudio playback
+   * but whose element has been replaced by an HTML element is loaded through that element's source instead.
+   */
   public setMediaElement(element: HTMLMediaElement) {
     if (this.isDestroyed) return
     this.unsubscribePlayerEvents()

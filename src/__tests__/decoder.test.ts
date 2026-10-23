@@ -39,6 +39,82 @@ describe('Decoder', () => {
     expect(close).not.toHaveBeenCalled()
   })
 
+  test('decodes at the device rate when no sample rate is given', async () => {
+    await Decoder.decode(new ArrayBuffer(0))
+
+    expect(global.AudioContext).toHaveBeenCalledWith(undefined)
+  })
+
+  describe('resample', () => {
+    const originalOfflineAudioContext = (globalThis as any).OfflineAudioContext
+
+    afterEach(() => {
+      ;(globalThis as any).OfflineAudioContext = originalOfflineAudioContext
+    })
+
+    test('reports whether an OfflineAudioContext is available', () => {
+      ;(globalThis as any).OfflineAudioContext = undefined
+      expect(Decoder.canResample()).toBe(false)
+      ;(globalThis as any).OfflineAudioContext = jest.fn()
+      expect(Decoder.canResample()).toBe(true)
+    })
+
+    test('renders the buffer at the new rate, in an offline context with the same channels', async () => {
+      const destination = {}
+      const node: any = { connect: jest.fn(), start: jest.fn() }
+      const rendered = {} as AudioBuffer
+      const OfflineContext = jest.fn().mockImplementation(() => ({
+        destination,
+        createBufferSource: () => node,
+        startRendering: () => Promise.resolve(rendered),
+      }))
+      ;(globalThis as any).OfflineAudioContext = OfflineContext
+      const source = { duration: 2, length: 96_000, sampleRate: 48_000, numberOfChannels: 2 } as AudioBuffer
+
+      await expect(Decoder.resample(source, 8_000)).resolves.toBe(rendered)
+
+      expect(OfflineContext).toHaveBeenCalledWith({ numberOfChannels: 2, length: 16_000, sampleRate: 8_000 })
+      expect(node.buffer).toBe(source)
+      expect(node.connect).toHaveBeenCalledWith(destination)
+      expect(node.start).toHaveBeenCalled()
+    })
+
+    test('renders at least one sample, even for an empty buffer', async () => {
+      const OfflineContext = jest.fn().mockImplementation(() => ({
+        destination: {},
+        createBufferSource: () => ({ connect: jest.fn(), start: jest.fn() }),
+        startRendering: () => Promise.resolve({} as AudioBuffer),
+      }))
+      ;(globalThis as any).OfflineAudioContext = OfflineContext
+
+      await Decoder.resample({ duration: 0, length: 0, sampleRate: 48_000, numberOfChannels: 1 } as AudioBuffer, 8_000)
+
+      expect(OfflineContext).toHaveBeenCalledWith(expect.objectContaining({ length: 1 }))
+    })
+
+    test.each([
+      // A fractional frame count (1396322.5) is truncated, as decodeAudioData truncates it
+      [8_377_935, 1_396_322],
+      // duration * rate is 2007.0000000000002 here, which rounding up from the duration turned into 2008
+      [12_042, 2_007],
+    ])(
+      'truncates a %i-frame 48 kHz buffer to %i frames at 8 kHz, as decodeAudioData does',
+      async (frames, expected) => {
+        const OfflineContext = jest.fn().mockImplementation(() => ({
+          destination: {},
+          createBufferSource: () => ({ connect: jest.fn(), start: jest.fn() }),
+          startRendering: () => Promise.resolve({} as AudioBuffer),
+        }))
+        ;(globalThis as any).OfflineAudioContext = OfflineContext
+        const source = { duration: frames / 48_000, length: frames, sampleRate: 48_000, numberOfChannels: 1 }
+
+        await Decoder.resample(source as AudioBuffer, 8_000)
+
+        expect(OfflineContext).toHaveBeenCalledWith(expect.objectContaining({ length: expected }))
+      },
+    )
+  })
+
   describe('createBuffer normalization', () => {
     test('normalizes all channels by the global max across channels, not channel 0 alone', () => {
       const buffer = Decoder.createBuffer(
