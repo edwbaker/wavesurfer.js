@@ -23,7 +23,14 @@ beforeEach(() => {
   contexts.clear()
   jest.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(function (this: HTMLCanvasElement) {
     if (!contexts.has(this)) {
-      contexts.set(this, { canvas: this, fillStyle: '', fillRect: jest.fn(), drawImage: jest.fn(), scale: jest.fn() })
+      contexts.set(this, {
+        canvas: this,
+        fillStyle: '',
+        fillRect: jest.fn(),
+        fillText: jest.fn(),
+        drawImage: jest.fn(),
+        scale: jest.fn(),
+      })
     }
     return contexts.get(this)
   } as any)
@@ -415,6 +422,67 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
 
     await deliver()
     expectShown(h, [next])
+  })
+
+  it('keeps the height of the picture on screen until a lower redraw replaces it', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    const h = createPlugin({}, { decoded })
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+    const wrapper = h.internals.canvasContainer.parentElement as HTMLElement
+    const [previous] = h.internals.canvases
+    expect(wrapper.style.height).toBe('200px')
+
+    const done = h.plugin.setOptions({ height: 100 })
+    // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
+    jest.advanceTimersByTime(20)
+    await flush()
+    const [next] = h.internals.canvases
+    expect(next).not.toBe(previous)
+
+    // With fillParent the wrapper hides its overflow: lowering it now would cut off the picture on screen
+    expectShown(h, [previous])
+    expect(wrapper.style.height).toBe('200px')
+
+    await deliver()
+    await done
+    expectShown(h, [next])
+    expect(wrapper.style.height).toBe('100px')
+  })
+
+  it('keeps the labels of the picture on screen until a redraw of a new range replaces it', async () => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    // At 256px the top label shows the maximum frequency
+    const h = createPlugin({ labels: true, height: 256 }, { decoded })
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+    const [previous] = h.internals.canvases
+    const labels = h.internals.canvasContainer.parentElement.querySelector(':scope > canvas')
+    const fillText: jest.Mock = contexts.get(labels)?.fillText
+    const topLabel = () => fillText.mock.calls[fillText.mock.calls.length - 1][0]
+    expect(topLabel()).toBe('4.0')
+
+    const done = h.plugin.setOptions({ frequencyMax: 2000 })
+    // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
+    jest.advanceTimersByTime(20)
+    await flush()
+    const [next] = h.internals.canvases
+    expect(next).not.toBe(previous)
+
+    // The picture on screen still shows up to 4 kHz, and so do its labels
+    expectShown(h, [previous])
+    expect(topLabel()).toBe('4.0')
+
+    await deliver()
+    await done
+    expectShown(h, [next])
+    expect(topLabel()).toBe('2.0')
   })
 
   it('puts a redraw on screen when trimming removes the only canvas still painting', async () => {

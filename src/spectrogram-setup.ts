@@ -556,6 +556,8 @@ export function spectrogramSetup(
   let previousCanvases: HTMLCanvasElement[] = []
   // The latest draw's readiness, run once its canvases are painted and on screen (see finishReplacement)
   let pendingReady: (() => void) | null = null
+  // The latest draw's wrapper height and labels, applied when its canvases replace an earlier picture
+  let pendingLayout: (() => void) | null = null
   // The request completions of the latest draw and of the draws it replaced before they were
   // painted, run in order once it is on screen (see drawSpectrogram)
   let pendingCompletions: Array<() => void> = []
@@ -666,20 +668,22 @@ export function spectrogramSetup(
     paintingCanvases.clear()
     drawnCanvases = {}
     pendingReady = null
+    pendingLayout = null
     // A draw with nothing to show runs these first, unless its analysis failed: then the failure
     // rejects what they wait for, as destroy() does
     pendingCompletions = []
   }
 
   // Starts a new draw's canvases. The canvases on screen stay there until the new ones are
-  // painted, while canvases of a superseded draw that never got on screen are dropped, and so is
-  // its readiness. Its request completion waits for the draw that replaces it
+  // painted, while canvases of a superseded draw that never got on screen are dropped, and so are
+  // its readiness and layout. Its request completion waits for the draw that replaces it
   function replaceCanvases(): void {
     previousCanvases.push(...canvases.filter((canvas) => canvas.parentNode))
     canvases = []
     paintingCanvases.clear()
     drawnCanvases = {}
     pendingReady = null
+    pendingLayout = null
   }
 
   // Attaches a canvas of the latest draw once its bitmaps are drawn. While an earlier draw's
@@ -693,8 +697,9 @@ export function spectrogramSetup(
   }
 
   // Once none of the latest draw's canvases is still painting, puts them on screen in place of an
-  // earlier draw's canvases, then reports the draw ready. Also run after a pass of lazy drawing,
-  // whose trimming can leave nothing painting without any canvas finishing
+  // earlier draw's canvases, with their wrapper height and labels, then reports the draw ready. Also
+  // run after a pass of lazy drawing, whose trimming can leave nothing painting without any canvas
+  // finishing
   function finishReplacement(): void {
     if (paintingCanvases.size > 0) return
     if (previousCanvases.length > 0) {
@@ -702,6 +707,9 @@ export function spectrogramSetup(
       previousCanvases = []
       canvases.forEach((painted) => canvasContainer.appendChild(painted))
     }
+    const layout = pendingLayout
+    pendingLayout = null
+    layout?.()
     const ready = pendingReady
     pendingReady = null
     ready?.()
@@ -1229,6 +1237,7 @@ export function spectrogramSetup(
         currentOptions.labelsHzColor || currentOptions.labelsColor,
         'center',
         channels,
+        { height: settings.height, frequencyMin: settings.frequencyMin, frequencyMax, scale: settings.scale },
       )
     }
 
@@ -1794,15 +1803,15 @@ export function spectrogramSetup(
     const { height: channelHeight, scale } = settings
     const colors = colorMap
 
-    // Set the height to fit all channels
+    // The height to fit all channels
     const totalHeight = channelHeight * frequenciesData.length
-    wrapper.style.height = totalHeight + 'px'
 
     const totalWidth = getWidth()
     const perCanvasWidth = Math.min(getMaxCanvasWidth(), totalWidth)
 
     // Nothing to render
     if (totalWidth === 0 || totalHeight === 0) {
+      wrapper.style.height = totalHeight + 'px'
       runPendingCompletions()
       clearCanvases()
       return false
@@ -1982,18 +1991,26 @@ export function spectrogramSetup(
       }
     }
 
-    if (options.labels) {
-      loadLabels(
-        currentOptions.labelsBackground,
-        '12px',
-        '12px',
-        '',
-        currentOptions.labelsColor,
-        currentOptions.labelsHzColor || currentOptions.labelsColor,
-        'center',
-        frequenciesData.length,
-      )
+    // The wrapper's height and the labels fit this draw's picture. With an earlier picture on screen,
+    // they change when this draw's canvases replace it, so that picture is never clipped or mislabelled
+    const showLayout = () => {
+      wrapper.style.height = totalHeight + 'px'
+      if (options.labels) {
+        loadLabels(
+          currentOptions.labelsBackground,
+          '12px',
+          '12px',
+          '',
+          currentOptions.labelsColor,
+          currentOptions.labelsHzColor || currentOptions.labelsColor,
+          'center',
+          frequenciesData.length,
+          { height: channelHeight, frequencyMin: freqMin, frequencyMax: freqMax, scale },
+        )
+      }
     }
+    if (previousCanvases.length > 0) pendingLayout = showLayout
+    else showLayout()
 
     // Ready once this draw's canvases are painted and on screen, so 'ready' listeners and settled
     // setOptions() calls see the new picture. A draw superseded before then never reports ready,
@@ -2022,10 +2039,12 @@ export function spectrogramSetup(
     textColorUnit: string | undefined,
     textAlign: CanvasTextAlign,
     channels: number,
+    // The settings of the picture the labels describe
+    drawn: { height: number; frequencyMin: number; frequencyMax: number; scale: Settings['scale'] },
   ): void {
     if (!labelsEl) return
 
-    const frequenciesHeight = settings.height
+    const frequenciesHeight = drawn.height
     bgFill = bgFill || 'rgba(68,68,68,0)'
     fontSizeFreq = fontSizeFreq || '12px'
     fontSizeUnit = fontSizeUnit || '12px'
@@ -2041,7 +2060,7 @@ export function spectrogramSetup(
     const canvasCtx = labelsEl.getContext('2d')
     if (!canvasCtx) return
     const dispScale = window.devicePixelRatio
-    labelsEl.height = settings.height * channels * dispScale
+    labelsEl.height = drawn.height * channels * dispScale
     labelsEl.width = bgWidth * dispScale
     canvasCtx.scale(dispScale, dispScale)
 
@@ -2058,7 +2077,7 @@ export function spectrogramSetup(
         canvasCtx.textAlign = textAlign
         canvasCtx.textBaseline = 'middle'
 
-        const freq = getLabelFrequency(i, labelIndex, settings.frequencyMin, frequencyMax, settings.scale)
+        const freq = getLabelFrequency(i, labelIndex, drawn.frequencyMin, drawn.frequencyMax, drawn.scale)
         const label = freqType(freq)
         const units = unitType(freq)
         const x = 16
