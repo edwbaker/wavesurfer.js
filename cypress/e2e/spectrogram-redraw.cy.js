@@ -56,7 +56,11 @@ const coversView = (win) => {
     const { left, right } = canvas.getBoundingClientRect()
     return clipped ? [Math.max(left, box.left), Math.min(right, box.right)] : [left, right]
   })
-  return spansCover(spans, Math.max(view.left, box.left), Math.min(view.right, box.right))
+  return (
+    box.right > view.left &&
+    box.left < view.right &&
+    spansCover(spans, Math.max(view.left, box.left), Math.min(view.right, box.right))
+  )
 }
 
 /**
