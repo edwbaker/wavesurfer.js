@@ -473,6 +473,38 @@ describe('SpectrogramPlugin setOptions in full rendering mode', () => {
       expect(analysis.state).toBe('rejected')
       expect(analysis.error.message).toBe('Worker timeout')
     })
+
+    it('rejects a display change whose redraw a failed analysis replaces before it is painted', async () => {
+      const h = createPlugin({ fallbackToMainThread: false })
+      await firstDraw()
+      // From here bitmaps are held, so the display redraw is still being painted when the analysis fails
+      const held: Array<() => void> = []
+      createImageBitmapMock.mockImplementation(
+        () => new Promise((resolve) => held.push(() => resolve({ close: jest.fn() }))),
+      )
+
+      const display = track(h.plugin.setOptions({ height: 300 }))
+      nextFrame()
+      await flush()
+      expect(held.length).toBeGreaterThan(0)
+
+      const analysis = track(h.plugin.setOptions({ fftSamples: 1024 }))
+      jest.advanceTimersByTime(50)
+      failRequest(lastPosted(), 'worker failed')
+      await flush()
+
+      // The redraw is never shown, so the failure rejects its display change too
+      expect(h.events.error).toHaveBeenCalledTimes(1)
+      const error = h.events.error.mock.calls[0][0]
+      expect(display.state).toBe('rejected')
+      expect(display.error).toBe(error)
+      expect(analysis.error).toBe(error)
+
+      held.splice(0).forEach((deliver) => deliver())
+      await flush()
+      expect(h.internals.canvasContainer.querySelectorAll('canvas')).toHaveLength(0)
+      expect(h.events.ready).toHaveBeenCalledTimes(1)
+    })
   })
 
   describe('empty draws and lost data', () => {

@@ -666,7 +666,8 @@ export function spectrogramSetup(
     paintingCanvases.clear()
     drawnCanvases = {}
     pendingReady = null
-    // A draw with nothing to show runs these first; destroy() has rejected what they wait for
+    // A draw with nothing to show runs these first, unless its analysis failed: then the failure
+    // rejects what they wait for, as destroy() does
     pendingCompletions = []
   }
 
@@ -1772,7 +1773,8 @@ export function spectrogramSetup(
     if (!input || input.length === 0 || input.every((channel) => !channel || channel.length === 0)) {
       // Nothing to draw (failed computation, or a buffer too short for a single FFT frame):
       // remove any previously drawn canvases so no stale spectrogram stays on screen. The draws
-      // this one replaced before they were painted are settled now
+      // this one replaced before they were painted are settled now, unless the analysis failed:
+      // they never get on screen, so the failure rejects their requests instead (see render())
       if (!analysisFailed()) runPendingCompletions()
       clearCanvases()
       return false
