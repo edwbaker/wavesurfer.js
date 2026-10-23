@@ -1,6 +1,7 @@
 // Full-mode spectrogram redraws in a real browser. A zoom, a scroll or a setOptions() call replaces
-// the picture without ever showing a blank, missing or clipped one, and lazy drawing follows the
-// view. jsdom has no layout, scrolling or canvas pixels, so the unit tests can't check these.
+// the picture without ever showing a blank, missing or clipped one, a zoom keeps the view painted all
+// across, and lazy drawing follows the view. jsdom has no layout, scrolling or canvas pixels, so the
+// unit tests can't check these.
 
 const id = '#waveform'
 const TIMEOUT = 20000
@@ -14,13 +15,12 @@ const CANVAS_WIDTH = 4096
 /** Resolves on the next `event` of a wavesurfer instance or plugin */
 const next = (emitter, event) => new Promise((resolve) => emitter.once(event, resolve))
 
-/** The spectrogram as it is on screen, and the waveform's view */
+/** The spectrogram as it is on screen, and the waveform's width */
 const picture = (win) => {
   const { canvasContainer } = win.spectrogram.__spectrogramInternalsForTests()
   return {
     wrapper: canvasContainer.parentElement,
     canvases: Array.from(canvasContainer.querySelectorAll('canvas')),
-    view: { left: win.wavesurfer.getScroll(), width: win.wavesurfer.getWidth() },
     width: win.wavesurfer.getWrapper().offsetWidth,
   }
 }
@@ -32,29 +32,46 @@ const middlePixel = (canvas) =>
 // The spectrogram is opaque: a canvas still transparent in the middle has not been painted
 const isPainted = (canvas) => middlePixel(canvas)[3] > 0
 
-/** Whether the canvases, side by side, cover the view without a gap */
-const covers = (canvases, { left, width }) => {
-  const spans = canvases
-    .map((canvas) => [parseFloat(canvas.style.left), parseFloat(canvas.style.left) + parseFloat(canvas.style.width)])
-    .sort((a, b) => a[0] - b[0])
-  let reached = left
-  for (const [start, end] of spans) {
-    if (start > reached) break
+/** Whether the [start, end] spans, side by side, cover from `from` to `to` without a gap */
+const spansCover = (spans, from, to) => {
+  let reached = from
+  for (const [start, end] of [...spans].sort((a, b) => a[0] - b[0])) {
+    if (start > reached + 1) break
     reached = Math.max(reached, end)
   }
-  return reached >= left + width
+  return reached >= to - 1
+}
+
+/**
+ * Whether the spectrogram is painted all across the waveform's view, as it is displayed: stretched
+ * to a new width, or clipped by its wrapper
+ */
+const coversView = (win) => {
+  const { wrapper, canvases } = picture(win)
+  // The waveform's scroll container
+  const view = win.wavesurfer.getWrapper().parentElement.getBoundingClientRect()
+  const box = wrapper.getBoundingClientRect()
+  const clipped = win.getComputedStyle(wrapper).overflowX === 'hidden'
+  const spans = canvases.map((canvas) => {
+    const { left, right } = canvas.getBoundingClientRect()
+    return clipped ? [Math.max(left, box.left), Math.min(right, box.right)] : [left, right]
+  })
+  return spansCover(spans, Math.max(view.left, box.left), Math.min(view.right, box.right))
 }
 
 /**
  * Checks the picture from now on, at every change to its canvases or its wrapper and at every frame,
  * and records what a viewer could have seen go wrong: no picture, a blank canvas, or a canvas of
- * another height than its wrapper, which clips it or leaves a gap.
+ * another height than its wrapper, which clips it or leaves a gap. With `coverage`, also a view not
+ * painted all across. That doesn't hold after a jump of the scroll position: lazy drawing paints the
+ * new view a moment later.
  */
-const watch = (win) => {
+const watch = (win, { coverage = false } = {}) => {
   const problems = []
   const check = (when) => {
     const { wrapper, canvases } = picture(win)
     if (canvases.length === 0) problems.push(`${when}: no canvas on screen`)
+    if (coverage && !coversView(win)) problems.push(`${when}: the view is not painted all across`)
     canvases.forEach((canvas) => {
       if (!isPainted(canvas)) problems.push(`${when}: a blank canvas at ${canvas.style.left}`)
       if (canvas.style.height !== wrapper.style.height) {
@@ -107,15 +124,15 @@ const scrollTo = (pixels) => cy.window().then((win) => win.wavesurfer.setScroll(
 /** Retries until painted canvases cover the waveform's view */
 const shouldShowTheView = () =>
   cy.window({ timeout: TIMEOUT }).should((win) => {
-    const { canvases, view } = picture(win)
+    const { canvases } = picture(win)
     expect(canvases.length, 'canvases on screen').to.be.above(0)
     expect(canvases.every(isPainted), 'every canvas is painted').to.equal(true)
-    expect(covers(canvases, view), `canvases cover ${view.left} to ${view.left + view.width}px`).to.equal(true)
+    expect(coversView(win), 'the canvases cover the view').to.equal(true)
   })
 
-const startWatching = () =>
+const startWatching = (options) =>
   cy.window().then((win) => {
-    win.watcher = watch(win)
+    win.watcher = watch(win, options)
   })
 
 const expectNothingWrongSeen = () =>
@@ -133,15 +150,15 @@ describe('Spectrogram full-mode redraws', () => {
 
   it('keeps a painted picture on screen through a zoom, then draws only around the view', () => {
     open()
-    startWatching()
+    startWatching({ coverage: true })
     zoomTo(LAZY_ZOOM)
     expectNothingWrongSeen()
 
     cy.window().then((win) => {
-      const { canvases, view, width } = picture(win)
+      const { canvases, width } = picture(win)
       expect(canvases.length).to.be.above(0)
       expect(canvases.length).to.be.below(Math.ceil(width / CANVAS_WIDTH))
-      expect(covers(canvases, view)).to.equal(true)
+      expect(coversView(win)).to.equal(true)
     })
   })
 
@@ -160,17 +177,20 @@ describe('Spectrogram full-mode redraws', () => {
     expectNothingWrongSeen()
   })
 
-  it('draws the end of the view after zooming out near the end', () => {
-    // Without fillParent the spectrogram's wrapper doesn't clip its canvases, so the wider picture
-    // keeps the view scrolled past the new end until the zoomed-out one replaces it
-    open({}, { fillParent: false, minPxPerSec: WIDE_ZOOM })
-    scrollTo(Number.MAX_SAFE_INTEGER)
-    shouldShowTheView()
+  // With fillParent, the default, the spectrogram's wrapper clips everything past the new width, the
+  // end of the picture the view was on included. Without it, that picture would hold the view past
+  // the new end. Either way, it stays in view stretched to the new width until the redraw replaces it
+  ;[true, false].forEach((fillParent) => {
+    it(`keeps the view painted when zooming out near the end, with fillParent: ${fillParent}`, () => {
+      open({}, { fillParent, minPxPerSec: WIDE_ZOOM })
+      scrollTo(Number.MAX_SAFE_INTEGER)
+      shouldShowTheView()
 
-    startWatching()
-    zoomTo(LAZY_ZOOM)
-    shouldShowTheView()
-    expectNothingWrongSeen()
+      startWatching({ coverage: true })
+      zoomTo(LAZY_ZOOM)
+      shouldShowTheView()
+      expectNothingWrongSeen()
+    })
   })
 
   it('settles setOptions() once the new picture is on screen, without clipping the old one', () => {
@@ -219,10 +239,10 @@ describe('Spectrogram full-mode redraws', () => {
 
     cy.window().then({ timeout: TIMEOUT }, (win) => win.spectrogram.setOptions({ height: 150 }))
     cy.window().then((win) => {
-      const { wrapper, canvases, view } = picture(win)
+      const { wrapper, canvases } = picture(win)
       expect(wrapper.style.height).to.equal('150px')
       canvases.forEach((canvas) => expect(canvas.style.height).to.equal('150px'))
-      expect(covers(canvases, view)).to.equal(true)
+      expect(coversView(win)).to.equal(true)
     })
 
     expectNothingWrongSeen()
