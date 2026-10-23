@@ -632,4 +632,42 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     expect(settled).toBe(true)
     await done
   })
+
+  it.each([
+    ['no frequency data', [] as Uint8Array[][], 600],
+    ['a zero width', makeFrames(), 0],
+  ])('settles a deferred display change when a frequency-data load with %s draws nothing', async (_, frames, width) => {
+    jest.useFakeTimers()
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    const h = createPlugin({}, { decoded })
+    // The first analysis is drawn and its bitmaps are still being drawn, so nothing is applied yet
+    jest.advanceTimersByTime(50)
+    await flush()
+    expect(held.length).toBeGreaterThan(0)
+    const ready = jest.fn()
+    h.plugin.on('ready', ready)
+
+    // A display change made now waits for a draw instead of asking for one
+    let settled = false
+    const done = h.plugin.setOptions({ height: 300 }).then(() => (settled = true))
+    // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
+
+    // A load replaces that draw and has nothing to show, so no draw is left to settle the change
+    h.size.width = width
+    const originalFetch = (globalThis as any).fetch
+    ;(globalThis as any).fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => frames })
+    try {
+      await h.plugin.loadFrequenciesData('frequencies.json')
+    } finally {
+      ;(globalThis as any).fetch = originalFetch
+    }
+    await flush()
+    expect(settled).toBe(true)
+
+    await deliver()
+    expectShown(h, [])
+    expect(ready).not.toHaveBeenCalled()
+    await done
+  })
 })

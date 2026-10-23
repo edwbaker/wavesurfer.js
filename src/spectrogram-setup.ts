@@ -1260,7 +1260,8 @@ export function spectrogramSetup(
     })
   }
 
-  // Resolves to whether the draw reports ready, as drawSpectrogram() returns
+  // Resolves to whether the draw reports ready, as drawSpectrogram() returns. A draw with nothing to
+  // show never does, so its beforeReady runs at once
   async function fetchAndDrawFrequencies(url: string | URL, beforeReady?: (version: number) => void): Promise<boolean> {
     const resp = await fetch(url)
     if (!resp.ok) {
