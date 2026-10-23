@@ -737,6 +737,33 @@ export function paintSpectrogramRows(
 }
 
 /**
+ * Paint one column of a spectrogram into `data`, an ImageData buffer `columnCount` pixels wide and
+ * `rowCount` rows tall, at column `columnIndex`: `column` holds one value per row, lowest bin at
+ * the bottom. `colorMap` needs the 256 entries setupColorMap makes.
+ *
+ * @deprecated The spectrogram no longer paints a column at a time: use `createSpectrogramBitmap`,
+ * or `paintSpectrogramRows` with a `createColorLookup` table, which paint whole images. This is
+ * kept for code that imports it from `dist/spectrogram-render-utils.js`, and may be removed in a
+ * later major version. It paints through `paintSpectrogramRows`, so a value that isn't a number
+ * paints color 0 where it used to throw.
+ */
+export function paintColumnPixels(
+  data: Uint8ClampedArray,
+  column: ArrayLike<number>,
+  colorMap: number[][],
+  columnIndex: number,
+  columnCount: number,
+  rowCount: number,
+): void {
+  // Painted as an image one pixel wide, then copied into its column a row at a time
+  const painted = new Uint8ClampedArray(rowCount * 4)
+  paintSpectrogramRows(painted, [column], createColorLookup(colorMap), rowCount, 0, rowCount)
+  for (let row = 0; row < rowCount; row++) {
+    data.set(painted.subarray(row * 4, row * 4 + 4), (row * columnCount + columnIndex) * 4)
+  }
+}
+
+/**
  * The bitmap `createImageBitmap(image, 0, sourceY, columns.length, sourceHeight)` makes of the
  * whole spectrogram image (see paintSpectrogramRows), which is how the frequency range is cropped
  * out of it. Only the image rows inside that source rectangle are painted, into an ImageData just

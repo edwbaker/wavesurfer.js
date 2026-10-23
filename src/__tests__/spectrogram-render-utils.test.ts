@@ -16,6 +16,7 @@ import {
   setupColorMap,
   createColorLookup,
   paintSpectrogramRows,
+  paintColumnPixels,
   createSpectrogramBitmap,
   getCanvasPixelRatio,
   getDefaultMaxCanvasWidth,
@@ -455,7 +456,7 @@ describe('applySparseFilterBank output buffers', () => {
 })
 
 // The per-pixel painter that paintSpectrogramRows replaced, kept as the reference it must match
-function paintColumnPixels(
+function paintColumnPixelsBefore(
   data: Uint8ClampedArray,
   column: ArrayLike<number>,
   colorMap: number[][],
@@ -477,7 +478,7 @@ function paintColumnPixels(
 /** The whole image (every bin), as the replaced painter drew it */
 function paintImageBefore(columns: ArrayLike<number>[], colorMap: number[][], binCount: number): Uint8ClampedArray {
   const data = new Uint8ClampedArray(columns.length * binCount * 4)
-  columns.forEach((column, i) => paintColumnPixels(data, column, colorMap, i, columns.length, binCount))
+  columns.forEach((column, i) => paintColumnPixelsBefore(data, column, colorMap, i, columns.length, binCount))
   return data
 }
 
@@ -576,6 +577,34 @@ describe('paintSpectrogramRows matches the per-pixel painter it replaced', () =>
 
     expect(Array.from(data)).toEqual([...color0, ...color0, ...color0])
     expect(() => paintImageBefore([column], colorMap, 3)).toThrow(TypeError)
+  })
+
+  describe('the deprecated paintColumnPixels, kept on top of it', () => {
+    for (const [name, colorMap] of Object.entries(colorMaps)) {
+      it(`paints each column into its place like before, with the ${name} color map`, () => {
+        for (const columns of [uint8Columns, plainColumns]) {
+          // A fresh image per column, so a pixel painted outside the column would show
+          const mismatched = columns.flatMap((column, x) => {
+            const data = new Uint8ClampedArray(WIDTH * BINS * 4)
+            const before = new Uint8ClampedArray(WIDTH * BINS * 4)
+            paintColumnPixels(data, column, colorMap, x, WIDTH, BINS)
+            paintColumnPixelsBefore(before, column, colorMap, x, WIDTH, BINS)
+            return data.some((byte, i) => byte !== before[i]) ? [x] : []
+          })
+          expect(mismatched).toEqual([])
+        }
+      })
+    }
+
+    it('paints a value that is not a number with color 0, like paintSpectrogramRows', () => {
+      const colorMap = colorMaps.roseus
+      const color0 = Array.from(new Uint8Array(createColorLookup(colorMap).buffer, 0, 4))
+      const data = new Uint8ClampedArray(4 * 3)
+
+      paintColumnPixels(data, [NaN, 'x' as unknown as number], colorMap, 0, 1, 3)
+
+      expect(Array.from(data)).toEqual([...color0, ...color0, ...color0])
+    })
   })
 })
 
