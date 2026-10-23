@@ -128,18 +128,21 @@ describe('lanczoz window', () => {
 })
 
 describe('FFT accuracy', () => {
-  // Direct O(N^2) DFT of the windowed frame, scaled like calculateSpectrum()
+  // Direct O(N^2) DFT of the windowed frame, scaled like calculateSpectrum(). Term k, t only needs
+  // the angle 2 * pi * (k * t mod n) / n, so the n cosines and sines are worked out once
   function directSpectrum(frame: Float32Array, windowValues: Float32Array): number[] {
     const n = frame.length
+    const cos = Array.from({ length: n }, (_, j) => Math.cos((-2 * Math.PI * j) / n))
+    const sin = Array.from({ length: n }, (_, j) => Math.sin((-2 * Math.PI * j) / n))
     const magnitudes: number[] = []
     for (let k = 0; k < n / 2; k++) {
       let re = 0
       let im = 0
       for (let t = 0; t < n; t++) {
-        const angle = (-2 * Math.PI * k * t) / n
         const x = frame[t] * windowValues[t]
-        re += x * Math.cos(angle)
-        im += x * Math.sin(angle)
+        const j = (k * t) % n
+        re += x * cos[j]
+        im += x * sin[j]
       }
       magnitudes.push((2 / n) * Math.hypot(re, im))
     }
@@ -156,7 +159,8 @@ describe('FFT accuracy', () => {
     return frame
   }
 
-  for (const size of [2, 4, 8, 64, 256]) {
+  // 512 points is the plugin's default (fftSamples), and 4096 a long window
+  for (const size of [2, 4, 8, 64, 256, 512, 4096]) {
     it(`matches a direct DFT for a ${size}-point transform`, () => {
       const frame = pseudoRandomFrame(size)
       const fft = new (FFT as any)(size, 16000, 'hann', undefined)
