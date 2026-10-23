@@ -1701,6 +1701,8 @@ export function spectrogramSetup(
     freqFrom: number,
     freqMin: number,
     freqMax: number,
+    scale: Settings['scale'],
+    colors: number[][],
   ): Promise<void> {
     // Data is already resampled for the total width
     const bitmapHeight = resampledPixels[0].length
@@ -1716,15 +1718,15 @@ export function spectrogramSetup(
     if (segmentPixels.length === 0) return Promise.resolve()
 
     // Calculate frequency scaling
-    const rMin = hzToScale(freqMin, settings.scale) / hzToScale(freqFrom, settings.scale)
-    const rMax = hzToScale(freqMax, settings.scale) / hzToScale(freqFrom, settings.scale)
+    const rMin = hzToScale(freqMin, scale) / hzToScale(freqFrom, scale)
+    const rMax = hzToScale(freqMax, scale) / hzToScale(freqFrom, scale)
     const rMax1 = Math.min(1, rMax)
 
     // Create and draw the bitmap - manage async properly. Only rows inside the frequency range are painted
     const bitmapPromise = createSpectrogramBitmap(
       segmentPixels,
       bitmapHeight,
-      colorMap,
+      colors,
       Math.round(bitmapHeight * (1 - rMax1)),
       Math.round(bitmapHeight * (rMax1 - rMin)),
     )
@@ -1783,8 +1785,14 @@ export function spectrogramSetup(
       ? (input as Uint8Array[][])
       : [input as Uint8Array[]]
 
+    // The display settings this draw paints with, kept for the canvases it draws later as the view
+    // scrolls. setOptions() replaces the settings at once, but this draw stays on screen until the
+    // next one is painted, after any new analysis, and its later canvases must match its first ones
+    const { height: channelHeight, scale } = settings
+    const colors = colorMap
+
     // Set the height to fit all channels
-    const totalHeight = settings.height * frequenciesData.length
+    const totalHeight = channelHeight * frequenciesData.length
     wrapper.style.height = totalHeight + 'px'
 
     const totalWidth = getWidth()
@@ -1840,7 +1848,7 @@ export function spectrogramSetup(
 
     // Draw background if needed
     const shouldDrawBackground = freqMax > freqFrom
-    const bgColor = shouldDrawBackground ? colorMap[colorMap.length - 1] : null
+    const bgColor = shouldDrawBackground ? colors[colors.length - 1] : null
 
     // Function to draw a single canvas
     const drawCanvas = (canvasIndex: number) => {
@@ -1875,13 +1883,15 @@ export function spectrogramSetup(
               resampledData[c],
               canvasCtx,
               canvasWidth,
-              settings.height,
-              c * settings.height,
+              channelHeight,
+              c * channelHeight,
               offset,
               totalWidth,
               freqFrom,
               freqMin,
               freqMax,
+              scale,
+              colors,
             ),
           )
         }

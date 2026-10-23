@@ -323,6 +323,50 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     expectShown(h, [...next, fourth, fifth])
   })
 
+  it('paints canvases drawn on scroll like the rest of their draw after the settings change', async () => {
+    jest.useFakeTimers()
+    const red = Array.from({ length: 256 }, () => [1, 0, 0, 1])
+    const blue = Array.from({ length: 256 }, () => [0, 0, 1, 1])
+    const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+    // Six 1000px canvases in a 600px view, showing 1000 to 3000 Hz of the 4000 Hz the data covers
+    const h = createPlugin(
+      { maxCanvasWidth: 1000, colorMap: red, frequencyMin: 1000, frequencyMax: 3000 },
+      { width: 6000, clientWidth: 600, decoded },
+    )
+    jest.advanceTimersByTime(50)
+    await flush()
+    await deliver()
+    expect(h.internals.canvases).toHaveLength(1)
+
+    // A new scale needs a new analysis, which starts after the 50 ms render throttle. Until it is
+    // drawn, the picture on screen stays and keeps drawing as the view scrolls
+    const done = h.plugin.setOptions({ height: 300, colorMap: blue, scale: 'mel' })
+    // Destroying the plugin rejects this: keep that from going unhandled
+    done.catch(() => undefined)
+    // 2700 to 3900px: canvases 2 and 3
+    h.view.scrollLeft = 3000
+    h.emitter.emit('scroll')
+    jest.advanceTimersByTime(16)
+    await deliver()
+    const canvases = h.internals.canvases.slice()
+    expect(canvases).toHaveLength(3)
+
+    // Every canvas has the height, frequency range and colours of the first one
+    canvases.forEach((canvas: HTMLCanvasElement) => {
+      expect(canvas.style.height).toBe('200px')
+      expect(drawImageOf(canvas)).toHaveBeenCalledWith(expect.anything(), 0, 0, 1000, 200)
+    })
+    const createImageBitmap = (globalThis as any).createImageBitmap as jest.Mock
+    const bitmaps = createImageBitmap.mock.calls.map(([image, ...source]) => [
+      image.height,
+      ...source,
+      ...image.data.slice(0, 4),
+    ])
+    expect(bitmaps).toHaveLength(3)
+    bitmaps.forEach((bitmap) => expect(bitmap).toEqual(bitmaps[0]))
+    expect(bitmaps[0].slice(-4)).toEqual([255, 0, 0, 255])
+  })
+
   it('keeps the picture on screen through the redraw that follows a resize', async () => {
     jest.useFakeTimers()
     const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
