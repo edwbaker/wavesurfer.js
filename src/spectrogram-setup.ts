@@ -1926,8 +1926,10 @@ export function spectrogramSetup(
 
         // The view is the waveform's scroll container. getWrapper() is the full-width content
         // inside it, which never scrolls itself
-        const scrollLeft = ctx.wavesurfer.getScroll() || 0
         const containerWidth = ctx.wavesurfer.getWidth() || 0
+        // Kept within this draw's width: after zooming out, the wider picture this draw replaces holds
+        // the view past the new end until it is removed, when the view moves back to the end
+        const scrollLeft = Math.min(ctx.wavesurfer.getScroll() || 0, Math.max(0, totalWidth - containerWidth))
 
         // Calculate visible range with some buffer
         const bufferRatio = 0.5 // Render 50% extra on each side

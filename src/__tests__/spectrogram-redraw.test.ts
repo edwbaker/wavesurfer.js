@@ -367,6 +367,32 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     expect(bitmaps[0].slice(-4)).toEqual([255, 0, 0, 255])
   })
 
+  it('draws the end of the new width when zooming out leaves the view past it', async () => {
+    jest.useFakeTimers()
+    // Ten 1000px canvases in a 600px view scrolled to the end: canvas 9
+    const h = createPlugin({ maxCanvasWidth: 1000 }, { width: 10000, clientWidth: 600 })
+    h.view.scrollLeft = 9400
+    const shownAtReady: number[] = []
+    h.plugin.on('ready', () => shownAtReady.push(h.internals.canvasContainer.querySelectorAll('canvas').length))
+    h.internals.drawSpectrogram(makeFrames())
+    await deliver()
+    const previous = h.internals.canvases.slice()
+    expect(previous).toHaveLength(1)
+
+    // Zoomed out to 5000px. The earlier picture still reaches 10000px, which keeps the view at 9400px
+    // until it is removed. Then the view is the end of the new width, 4400 to 5000px: canvas 4
+    h.size.width = 5000
+    h.internals.drawSpectrogram(makeFrames())
+    const next = h.internals.canvases.slice()
+    expect(next).toHaveLength(1)
+    expect(next[0].style.left).toBe('4000px')
+    expectShown(h, previous)
+
+    await deliver()
+    expectShown(h, next)
+    expect(shownAtReady).toEqual([1, 1])
+  })
+
   it('keeps the picture on screen through the redraw that follows a resize', async () => {
     jest.useFakeTimers()
     const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
