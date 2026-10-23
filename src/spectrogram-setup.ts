@@ -1251,7 +1251,13 @@ export function spectrogramSetup(
       )
       return
     }
-    await fetchAndDrawFrequencies(url)
+    // The load is drawn with the current display options, so once it is on screen it settles the
+    // display changes waiting for a draw, as a redraw would. Its data is not an analysis, so
+    // requests waiting for one keep waiting
+    await fetchAndDrawFrequencies(url, (drawn) => {
+      appliedVersion = Math.max(appliedVersion, drawn)
+      settleRequests(drawn, null, (request) => request.generation === null)
+    })
   }
 
   // Resolves to whether the draw reports ready, as drawSpectrogram() returns
