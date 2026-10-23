@@ -559,9 +559,11 @@ export function spectrogramSetup(
   // The latest draw's wrapper height and labels, applied when its canvases replace an earlier picture
   let pendingLayout: (() => void) | null = null
   // The width the latest draw is drawn for, and the width the picture on screen was drawn for (0 when
-  // there is none), which differ after a zoom or a resize until a redraw for the new width is shown
+  // there is none), which differ after a zoom or a resize until a redraw for the new width is shown.
+  // Meanwhile the picture is shown stretched by shownScale, or as drawn when that is 1
   let latestWidth = 0
   let shownWidth = 0
+  let shownScale = 1
   // The request completions of the latest draw and of the draws it replaced before they were
   // painted, run in order once it is on screen (see drawSpectrogram)
   let pendingCompletions: Array<() => void> = []
@@ -732,13 +734,40 @@ export function spectrogramSetup(
     ready?.()
   }
 
-  // Stretches the picture on screen to the waveform's width. After a zoom or a resize the waveform is
-  // redrawn at once, and the spectrogram only once its redraw for the new width is painted: until
-  // then its picture stays aligned with the waveform, and in view
+  // Shows the picture on screen at the waveform's width. After a zoom or a resize the waveform is
+  // redrawn at once, and the spectrogram only once its redraw for the new width is painted. Until
+  // then the picture is stretched to the new width, which keeps it aligned with the waveform and in
+  // view, unless it covers more of the view as drawn: a lazily drawn picture only has canvases around
+  // the view it was drawn for, so shrinking it for a zoom out can leave most of the new view blank
   function alignPicture(): void {
     const width = shownWidth > 0 ? getWidth() : 0
-    canvasContainer.style.width = shownWidth > 0 ? `${shownWidth}px` : '100%'
-    canvasContainer.style.transform = width > 0 && width !== shownWidth ? `scaleX(${width / shownWidth})` : ''
+    const stretch = width > 0 && width !== shownWidth ? width / shownWidth : 1
+    shownScale = stretch !== 1 && coveredWidth(stretch, width) >= coveredWidth(1, width) ? stretch : 1
+    // Stretched, the container is as wide as the picture, so its box ends where the picture does
+    canvasContainer.style.width = shownScale !== 1 ? `${shownWidth}px` : '100%'
+    canvasContainer.style.transform = shownScale !== 1 ? `scaleX(${shownScale})` : ''
+  }
+
+  // How much of the view the canvases on screen cover when shown at `scale`. The view is taken within
+  // `width`, where it is once the redraw for that width replaces the picture
+  function coveredWidth(scale: number, width: number): number {
+    const viewWidth = ctx.wavesurfer?.getWidth() || 0
+    const start = Math.min(ctx.wavesurfer?.getScroll() || 0, Math.max(0, width - viewWidth))
+    const end = Math.min(start + viewWidth, width)
+    const spans = Array.from(canvasContainer.children as HTMLCollectionOf<HTMLElement>, (canvas) => {
+      const left = parseFloat(canvas.style.left) * scale
+      return [left, left + parseFloat(canvas.style.width) * scale]
+    }).sort((a, b) => a[0] - b[0])
+    let covered = 0
+    let reached = start
+    for (const [left, right] of spans) {
+      const from = Math.max(left, reached)
+      const to = Math.min(right, end)
+      if (to <= from) continue
+      covered += to - from
+      reached = to
+    }
+    return covered
   }
 
   // Runs the request completions waiting for the latest draw, in the order of their draws
@@ -1965,9 +1994,9 @@ export function spectrogramSetup(
 
         // The view is the waveform's scroll container. getWrapper() is the full-width content
         // inside it, which never scrolls itself. The view is measured in this draw's pixels: after a
-        // zoom or a resize, this draw's picture is stretched to the new width until the redraw for
-        // it is shown (see alignPicture)
-        const scale = getWidth() / totalWidth || 1
+        // zoom or a resize, this draw's picture can be stretched to the new width until the redraw
+        // for it is shown (see alignPicture). Until it is on screen, take it as stretched
+        const scale = previousCanvases.length === 0 ? shownScale : getWidth() / totalWidth || 1
         const containerWidth = (ctx.wavesurfer.getWidth() || 0) / scale
         // Kept within this draw's width: after zooming out, the wider picture this draw replaces can
         // hold the view past the new end until it is removed, when the view moves back to the end
@@ -2258,9 +2287,12 @@ export function spectrogramSetup(
   } else {
     ctx.scope.add(
       ctx.wavesurfer.on('redraw', () => {
-        // The waveform has its new width already. The picture follows it at once, and is redrawn for
-        // it after the render throttle
-        alignPicture()
+        // The waveform has its new width already, and wavesurfer then moves the view to keep its
+        // cursor in place. The picture follows once it has, before the next frame, and is redrawn
+        // for the new width after the render throttle
+        Promise.resolve().then(() => {
+          if (!ctx.scope.disposed) alignPicture()
+        })
         throttledRender()
       }),
     )
