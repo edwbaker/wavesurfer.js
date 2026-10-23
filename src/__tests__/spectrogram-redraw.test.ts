@@ -581,6 +581,77 @@ describe('SpectrogramPlugin full rendering mode redraws', () => {
     expect(container.style.transform).toBe('scaleX(0.5)')
   })
 
+  describe('a draw painted after the waveform has changed width again', () => {
+    /** A picture fitted to 600px, then a draw for 6000px still being painted when the waveform is fitted again */
+    async function zoomInAndBack() {
+      jest.useFakeTimers()
+      const decoded = createFakeAudioBuffer(Float32Array.from({ length: 8000 }, (_, i) => Math.sin(i)))
+      const h = createPlugin({ maxCanvasWidth: 1000 }, { width: 600, clientWidth: 600, decoded, fillParent: true })
+      const ready = jest.fn()
+      h.plugin.on('ready', ready)
+      jest.advanceTimersByTime(50)
+      await flush()
+      await deliver()
+      const fitted = h.internals.canvases.slice()
+
+      // Zoomed to 6000px with the view at the end. 50ms later a draw for 6000px starts, and is painted
+      // around the view: canvas 5. A display change made meanwhile waits for that draw
+      h.size.width = 6000
+      h.view.scrollLeft = 5400
+      h.emitter.emit('redraw')
+      await flush()
+      let settled = false
+      const done = h.plugin.setOptions({ height: 300 }).then(() => (settled = true))
+      // If an expectation fails first, destroying the plugin rejects this: keep that from going unhandled
+      done.catch(() => undefined)
+      jest.advanceTimersByTime(50)
+      const zoomed = h.internals.canvases.slice()
+      expect(zoomed.map((canvas: HTMLCanvasElement) => canvas.style.left)).toEqual(['5000px'])
+
+      // Fitted again before it is painted, and painted before the redraw for 600px starts
+      h.size.width = 600
+      h.view.scrollLeft = 0
+      h.emitter.emit('redraw')
+      await flush()
+      await deliver()
+      return { h, ready, fitted, zoomed, done, isSettled: () => settled }
+    }
+
+    it('leaves the picture on screen until the redraw for the current width replaces it', async () => {
+      const { h, ready, fitted, done, isSettled } = await zoomInAndBack()
+
+      // Its canvas at 5000 to 6000px would show at 500 to 600px, a sixth of the view the fitted picture
+      // covers. It is neither shown nor reported ready, and the display change waits on
+      expectShown(h, fitted)
+      expect(ready).toHaveBeenCalledTimes(1)
+      expect(isSettled()).toBe(false)
+
+      // The redraw for 600px replaces the fitted picture, and settles the display change in its place
+      jest.advanceTimersByTime(50)
+      const next = h.internals.canvases.slice()
+      await deliver()
+      expectShown(h, next)
+      expect(ready).toHaveBeenCalledTimes(2)
+      expect(isSettled()).toBe(true)
+      await done
+    })
+
+    it('puts it on screen once the waveform is back at its width', async () => {
+      const { h, ready, zoomed, done, isSettled } = await zoomInAndBack()
+
+      // Zoomed to 6000px again before the redraw for 600px starts: the held-back draw fits again
+      h.size.width = 6000
+      h.view.scrollLeft = 5400
+      h.emitter.emit('redraw')
+      await flush()
+      expectShown(h, zoomed)
+      expect(h.internals.canvasContainer.style.transform).toBe('')
+      expect(ready).toHaveBeenCalledTimes(2)
+      expect(isSettled()).toBe(true)
+      await done
+    })
+  })
+
   it('puts a redraw on screen when trimming removes the only canvas still painting', async () => {
     jest.useFakeTimers()
     // 100px canvases and an 800px view: at 400px the view and half its width either side need

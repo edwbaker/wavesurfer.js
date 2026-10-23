@@ -716,10 +716,14 @@ export function spectrogramSetup(
   // Once none of the latest draw's canvases is still painting, puts them on screen in place of an
   // earlier draw's canvases, with their wrapper height and labels, then reports the draw ready. Also
   // run after a pass of lazy drawing, whose trimming can leave nothing painting without any canvas
-  // finishing
+  // finishing, and after the waveform is redrawn
   function finishReplacement(): void {
     if (paintingCanvases.size > 0) return
     if (previousCanvases.length > 0) {
+      // A draw for a width the waveform no longer has leaves the picture on screen, which can fit the
+      // new width better. The redraw for that width replaces it, and settles what this draw would
+      // have. If the waveform is back at this draw's width first, this draw goes on screen then
+      if (latestWidth !== getWidth()) return
       previousCanvases.forEach((previous) => previous.remove())
       previousCanvases = []
       canvases.forEach((painted) => canvasContainer.appendChild(painted))
@@ -2289,9 +2293,12 @@ export function spectrogramSetup(
       ctx.wavesurfer.on('redraw', () => {
         // The waveform has its new width already, and wavesurfer then moves the view to keep its
         // cursor in place. The picture follows once it has, before the next frame, and is redrawn
-        // for the new width after the render throttle
+        // for the new width after the render throttle. A painted draw held back for another width
+        // goes on screen if the waveform is back at its width
         Promise.resolve().then(() => {
-          if (!ctx.scope.disposed) alignPicture()
+          if (ctx.scope.disposed) return
+          alignPicture()
+          finishReplacement()
         })
         throttledRender()
       }),
