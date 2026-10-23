@@ -1773,7 +1773,7 @@ export function spectrogramSetup(
       // Nothing to draw (failed computation, or a buffer too short for a single FFT frame):
       // remove any previously drawn canvases so no stale spectrogram stays on screen. The draws
       // this one replaced before they were painted are settled now
-      runPendingCompletions()
+      if (!analysisFailed()) runPendingCompletions()
       clearCanvases()
       return false
     }
