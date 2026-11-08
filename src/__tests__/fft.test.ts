@@ -126,3 +126,107 @@ describe('lanczoz window', () => {
     }
   })
 })
+
+describe('FFT accuracy', () => {
+  // Direct O(N^2) DFT of the windowed frame, scaled like calculateSpectrum(). Term k, t only needs
+  // the angle 2 * pi * (k * t mod n) / n, so the n cosines and sines are worked out once
+  function directSpectrum(frame: Float32Array, windowValues: Float32Array): number[] {
+    const n = frame.length
+    const cos = Array.from({ length: n }, (_, j) => Math.cos((-2 * Math.PI * j) / n))
+    const sin = Array.from({ length: n }, (_, j) => Math.sin((-2 * Math.PI * j) / n))
+    const magnitudes: number[] = []
+    for (let k = 0; k < n / 2; k++) {
+      let re = 0
+      let im = 0
+      for (let t = 0; t < n; t++) {
+        const x = frame[t] * windowValues[t]
+        const j = (k * t) % n
+        re += x * cos[j]
+        im += x * sin[j]
+      }
+      magnitudes.push((2 / n) * Math.hypot(re, im))
+    }
+    return magnitudes
+  }
+
+  function pseudoRandomFrame(length: number): Float32Array {
+    const frame = new Float32Array(length)
+    let state = 7
+    for (let i = 0; i < length; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+      frame[i] = (state / 4294967296) * 2 - 1
+    }
+    return frame
+  }
+
+  // 512 points is the plugin's default (fftSamples), and 4096 a long window
+  for (const size of [2, 4, 8, 64, 256, 512, 4096]) {
+    it(`matches a direct DFT for a ${size}-point transform`, () => {
+      const frame = pseudoRandomFrame(size)
+      const fft = new (FFT as any)(size, 16000, 'hann', undefined)
+      const spectrum = fft.calculateSpectrum(frame)
+      const expected = directSpectrum(frame, fft.windowValues)
+
+      expect(spectrum.length).toBe(size / 2)
+      for (let k = 0; k < size / 2; k++) {
+        expect(Math.abs(spectrum[k] - expected[k])).toBeLessThan(1e-5)
+      }
+    })
+  }
+
+  it('matches a direct DFT for a zero-padded window', () => {
+    const frame = pseudoRandomFrame(64)
+    const fft = new (FFT as any)(64, 16000, 'blackman', undefined, 40)
+    const spectrum = fft.calculateSpectrum(frame)
+    const expected = directSpectrum(frame, fft.windowValues)
+
+    for (let k = 0; k < 32; k++) {
+      expect(Math.abs(spectrum[k] - expected[k])).toBeLessThan(1e-5)
+    }
+  })
+})
+
+describe('FFT output buffers', () => {
+  function makeFrame(length: number, seed: number): Float32Array {
+    const frame = new Float32Array(length)
+    let state = seed
+    for (let i = 0; i < length; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0
+      frame[i] = (state / 4294967296) * 2 - 1
+    }
+    return frame
+  }
+
+  it('writes into a supplied buffer and returns that buffer', () => {
+    const fft = new (FFT as any)(64, 16000, 'hann', undefined)
+    const frame = makeFrame(64, 3)
+    const fresh = Array.from(fft.calculateSpectrum(frame))
+
+    const out = new Float32Array(32)
+    const result = fft.calculateSpectrum(frame, out)
+
+    expect(result).toBe(out)
+    expect(Array.from(result)).toEqual(fresh)
+  })
+
+  it('does not carry values from an earlier frame into a reused buffer', () => {
+    const fft = new (FFT as any)(64, 16000, 'hann', undefined)
+    const out = new Float32Array(32)
+    fft.calculateSpectrum(makeFrame(64, 1), out)
+
+    const second = makeFrame(64, 2)
+    const expected = Array.from(new (FFT as any)(64, 16000, 'hann', undefined).calculateSpectrum(second))
+
+    expect(Array.from(fft.calculateSpectrum(second, out))).toEqual(expected)
+  })
+
+  it('ignores a supplied buffer of the wrong length', () => {
+    const fft = new (FFT as any)(64, 16000, 'hann', undefined)
+    const wrong = new Float32Array(7)
+
+    const result = fft.calculateSpectrum(makeFrame(64, 4), wrong)
+
+    expect(result).not.toBe(wrong)
+    expect(result.length).toBe(32)
+  })
+})

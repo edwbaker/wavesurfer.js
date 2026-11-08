@@ -7,7 +7,7 @@
  * them in their own leaf module also lets spectrogram-windowing.ts and spectrogram-setup.ts both
  * import from here without creating a spectrogram-setup.ts <-> spectrogram-windowing.ts import
  * cycle (rollup flags exactly that as a "Circular dependency" build warning if shared helpers like
- * paintColumnPixels lived on either side instead of a dependency-free leaf both already import
+ * paintSpectrogramRows lived on either side instead of a dependency-free leaf both already import
  * scale/colormap helpers from).
  */
 
@@ -147,14 +147,21 @@ function createSparseFilterBank(
   return filterBank
 }
 
-export function applySparseFilterBank(fftPoints: Float32Array, filterBank: SparseFilter[]): Float32Array {
+/**
+ * Apply a sparse filter bank to one frame of FFT magnitudes. Pass `out` to reuse a buffer across
+ * frames when the result is consumed before the next call; every entry is overwritten.
+ */
+export function applySparseFilterBank(
+  fftPoints: Float32Array,
+  filterBank: SparseFilter[],
+  out?: Float32Array,
+): Float32Array {
   const numFilters = filterBank.length
-  const logSpectrum = new Float32Array(numFilters)
+  const logSpectrum = out && out.length === numFilters ? out : new Float32Array(numFilters)
   for (let i = 0; i < numFilters; i++) {
     const { lo, weightLo, weightHi } = filterBank[i]
-    if (lo >= 0 && lo < fftPoints.length) {
-      logSpectrum[i] = fftPoints[lo] * weightLo
-    }
+    // Assigned rather than accumulated into, so a reused buffer never keeps an earlier frame's value
+    logSpectrum[i] = lo >= 0 && lo < fftPoints.length ? fftPoints[lo] * weightLo : 0
     if (lo + 1 >= 0 && lo + 1 < fftPoints.length) {
       logSpectrum[i] += fftPoints[lo + 1] * weightHi
     }
@@ -650,27 +657,95 @@ export function setupColorMap(colorMap: number[][] | 'gray' | 'igray' | 'roseus'
 }
 
 /**
- * Map one column's dB-quantized bin values into an ImageData buffer's RGBA bytes via colorMap,
- * for CSS pixel column `columnIndex` of `columnCount` total, `rowCount` bins tall. Shared by
- * spectrogram-setup.ts's full-mode canvas path (fillImageDataQuality) and
- * spectrogram-windowing.ts's windowed-mode canvas path (renderChannelToCanvas) so the two
- * rendering strategies draw identically instead of drifting - which they had: windowed clamped
- * `column[row]` into [0, 255] before indexing colorMap, full mode's fillImageDataQuality did
- * not. Clamping is the correct form (this is the form both paths are unified on): `column`
- * values are Uint8Array entries (already 0-255) for every internally-computed segment, but
+ * The first 256 colorMap entries (every index a bin value can clamp to) as packed RGBA pixels,
+ * for paintSpectrogramRows to write one 32-bit word per pixel. The bytes are stored through a
+ * Uint8ClampedArray, so they round exactly like the per-pixel `color * 255` ImageData stores this
+ * replaces, and the words are a Uint32Array view of those same bytes, so a word written through a
+ * Uint32Array view of ImageData lands in RGBA order on either platform byte order.
+ */
+export function createColorLookup(colorMap: number[][]): Uint32Array {
+  const bytes = new Uint8ClampedArray(256 * 4)
+  for (let i = 0; i < 256; i++) {
+    const color = colorMap[i]
+    bytes[i * 4] = color[0] * 255
+    bytes[i * 4 + 1] = color[1] * 255
+    bytes[i * 4 + 2] = color[2] * 255
+    bytes[i * 4 + 3] = color[3] * 255
+  }
+  return new Uint32Array(bytes.buffer)
+}
+
+/**
+ * Paint image rows `firstRow` to `firstRow + rowCount` of a spectrogram into `data`, an ImageData
+ * buffer `columns.length` pixels wide and `rowCount` rows tall. The whole image has one pixel
+ * column per entry of `columns` and `binCount` rows, lowest bin at the bottom, so image row r
+ * shows bin `binCount - 1 - r`. `colors` comes from createColorLookup.
+ *
+ * Shared by spectrogram-setup.ts's full-mode canvas path and spectrogram-windowing.ts's
+ * windowed-mode canvas path (both through createSpectrogramBitmap) so the two rendering strategies
+ * draw identically instead of drifting - which they had: windowed clamped bin values into
+ * [0, 255] before indexing colorMap, full mode did not. Clamping is the correct form: values are
+ * Uint8Array entries (already 0-255) for every internally-computed segment, but
  * loadFrequenciesData's externally supplied JSON (see SpectrogramPluginOptions.frequenciesDataUrl
- * in spectrogram-setup.ts) is only assumed, never runtime-validated, to already be in range - an
- * out-of-range index would otherwise read `colorMap[colorIndex]` out of bounds and throw on
- * `color[0]` off `undefined` instead of just rendering the nearest valid color. The clamped value
- * is also floored, since the same external JSON can carry fractional values, and a fractional
- * index (`colorMap[12.7]`) is just as much an out-of-bounds read as a negative one.
+ * in spectrogram-setup.ts) is only assumed, never runtime-validated, to already be in range, and
+ * an out-of-range value must render the nearest valid color. The clamped value is also floored,
+ * since the same external JSON can carry fractional values. A plain-array value that isn't a
+ * number at all (e.g. missing from a short column) renders color 0.
+ *
+ * Paints a column at a time, reading each column in order. Painting a row at a time writes the
+ * image in order instead, but reads one value from every column per row, and measured several
+ * times slower on full-mode-wide images.
  *
  * Lives here (not in spectrogram-setup.ts, despite being consumed there too) so
  * spectrogram-windowing.ts - which spectrogram-setup.ts already imports SegmentManager etc. from
  * - can use it too without a spectrogram-setup.ts <-> spectrogram-windowing.ts import cycle
  * (rollup flags exactly that as a "Circular dependency" build warning if this lived on the other
  * side). This module is a dependency-free leaf both files already import scale/colormap helpers
- * from, so it's the natural shared home for a third pure colorMap-indexing helper.
+ * from, so it's the natural shared home for the colorMap painting helpers.
+ */
+export function paintSpectrogramRows(
+  data: Uint8ClampedArray,
+  columns: ArrayLike<ArrayLike<number>>,
+  colors: Uint32Array,
+  binCount: number,
+  firstRow: number,
+  rowCount: number,
+): void {
+  const width = columns.length
+  const pixels = new Uint32Array(data.buffer, data.byteOffset, width * rowCount)
+  // The bin shown in the bottom painted row
+  const lowBin = binCount - firstRow - rowCount
+  const highBin = lowBin + rowCount
+  for (let x = 0; x < width; x++) {
+    const column = columns[x]
+    let pixel = (rowCount - 1) * width + x
+    if (column instanceof Uint8Array) {
+      // Already integers 0-255
+      for (let bin = lowBin; bin < highBin; bin++) {
+        pixels[pixel] = colors[column[bin]]
+        pixel -= width
+      }
+    } else {
+      for (let bin = lowBin; bin < highBin; bin++) {
+        const value = column[bin]
+        // Clamp, then floor (`| 0` floors the positive values left after the clamp)
+        pixels[pixel] = colors[value >= 255 ? 255 : value > 0 ? value | 0 : 0]
+        pixel -= width
+      }
+    }
+  }
+}
+
+/**
+ * Paint one column of a spectrogram into `data`, an ImageData buffer `columnCount` pixels wide and
+ * `rowCount` rows tall, at column `columnIndex`: `column` holds one value per row, lowest bin at
+ * the bottom. `colorMap` needs the 256 entries setupColorMap makes.
+ *
+ * @deprecated The spectrogram no longer paints a column at a time: use `createSpectrogramBitmap`,
+ * or `paintSpectrogramRows` with a `createColorLookup` table, which paint whole images. This is
+ * kept for code that imports it from `dist/spectrogram-render-utils.js`, and may be removed in a
+ * later major version. It paints through `paintSpectrogramRows`, so a value that isn't a number
+ * paints color 0 where it used to throw.
  */
 export function paintColumnPixels(
   data: Uint8ClampedArray,
@@ -680,17 +755,43 @@ export function paintColumnPixels(
   columnCount: number,
   rowCount: number,
 ): void {
+  // Painted as an image one pixel wide, then copied into its column a row at a time
+  const painted = new Uint8ClampedArray(rowCount * 4)
+  paintSpectrogramRows(painted, [column], createColorLookup(colorMap), rowCount, 0, rowCount)
   for (let row = 0; row < rowCount; row++) {
-    // Floor AFTER clamping: externally-supplied frequenciesDataUrl JSON can carry fractional
-    // values, and a fractional index (colorMap[12.7] === undefined) would throw mid-draw
-    const colorIndex = Math.floor(Math.min(255, Math.max(0, column[row])))
-    const color = colorMap[colorIndex]
-    const pixelIndex = ((rowCount - row - 1) * columnCount + columnIndex) * 4
-    data[pixelIndex] = color[0] * 255
-    data[pixelIndex + 1] = color[1] * 255
-    data[pixelIndex + 2] = color[2] * 255
-    data[pixelIndex + 3] = color[3] * 255
+    data.set(painted.subarray(row * 4, row * 4 + 4), (row * columnCount + columnIndex) * 4)
   }
+}
+
+/**
+ * The bitmap `createImageBitmap(image, 0, sourceY, columns.length, sourceHeight)` makes of the
+ * whole spectrogram image (see paintSpectrogramRows), which is how the frequency range is cropped
+ * out of it. Only the image rows inside that source rectangle are painted, into an ImageData just
+ * that tall, and the rectangle is moved to match: any part of it outside the image still comes
+ * out transparent, and a rectangle createImageBitmap rejects (zero height) is still rejected.
+ * `sourceY` and `sourceHeight` are whole numbers, or NaN or infinite, which createImageBitmap
+ * treats as 0.
+ */
+export function createSpectrogramBitmap(
+  columns: ArrayLike<ArrayLike<number>>,
+  binCount: number,
+  colorMap: number[][],
+  sourceY: number,
+  sourceHeight: number,
+): Promise<ImageBitmap> {
+  const width = columns.length
+  const y = Number.isFinite(sourceY) ? sourceY : 0
+  const height = Number.isFinite(sourceHeight) ? sourceHeight : 0
+  // A negative height extends the rectangle up from y
+  const firstRow = Math.min(Math.max(Math.min(y, y + height), 0), binCount)
+  const endRow = Math.min(Math.max(Math.max(y, y + height), 0), binCount)
+  const imageData = new ImageData(width, Math.max(1, endRow - firstRow))
+  if (endRow > firstRow) {
+    // The color table takes microseconds to build, so it is built per bitmap rather than cached:
+    // a colorMap array edited in place still shows on the next draw
+    paintSpectrogramRows(imageData.data, columns, createColorLookup(colorMap), binCount, firstRow, endRow - firstRow)
+  }
+  return createImageBitmap(imageData, 0, y - firstRow, width, height)
 }
 
 // Conservative cross-browser per-side canvas limit (Chrome/Firefox cap a side at 32767px).
@@ -718,6 +819,27 @@ export function getCanvasPixelRatio(cssWidth: number, cssHeight: number): number
       Math.sqrt(MAX_CANVAS_AREA / (cssWidth * cssHeight)),
     ),
   )
+}
+
+// The widest canvas backing store every major browser still draws on the GPU: Firefox's limit
+// (gfx.canvas.accelerated.max-size) and iOS Safari's (its IOSurface limit) are both 8,192 px.
+// Chromium's is the GPU's maximum texture size, typically 16,384 px on desktops.
+const GPU_CANVAS_MAX_SIDE = 8192
+// Also under the widest image Firefox draws on the GPU (gfx.canvas.accelerated.max-surface-size,
+// 5,280 px): each full-mode canvas draws one bitmap as wide as its CSS width
+const DEFAULT_MAX_CANVAS_WIDTH = 4096
+
+/**
+ * Default maxCanvasWidth for full-mode canvases, in CSS pixels: 4,096, and at most 8,192 divided
+ * by the device pixel ratio, so the backing store (see getCanvasPixelRatio) stays within 8,192 px.
+ * Above their GPU limit, browsers draw a canvas on the CPU, which is slower and filters a scaled
+ * bitmap differently, so a canvas past the limit would look slightly different from its
+ * neighbors. Narrow canvases also keep each canvas that lazy drawing paints as it scrolls into
+ * view a short task.
+ */
+export function getDefaultMaxCanvasWidth(): number {
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+  return Math.max(1, Math.min(DEFAULT_MAX_CANVAS_WIDTH, Math.floor(GPU_CANVAS_MAX_SIDE / dpr)))
 }
 
 /**

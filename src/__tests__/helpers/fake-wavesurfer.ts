@@ -15,6 +15,8 @@ export interface FakeWaveSurfer {
   options: Record<string, unknown>
   getWrapper: () => HTMLElement
   getDecodedData: () => AudioBuffer | null
+  getScroll: () => number
+  getWidth: () => number
   on: (...args: any[]) => () => void
 }
 
@@ -38,6 +40,8 @@ export function createFakeWaveSurfer(overrides: Partial<FakeWaveSurfer> & Record
     options: {},
     getWrapper: () => wrapper,
     getDecodedData: () => null,
+    getScroll: () => 0,
+    getWidth: () => 600,
     on: () => () => undefined,
     ...overrides,
   }

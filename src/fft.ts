@@ -27,10 +27,17 @@ function FFT(bufferSize: number, sampleRate: number, windowFunc: string, alpha: 
   this.sampleRate = sampleRate
   this.bandwidth = (2 / bufferSize) * (sampleRate / 2)
 
-  this.sinTable = new Float32Array(bufferSize)
-  this.cosTable = new Float32Array(bufferSize)
+  // A real input of bufferSize samples is packed into a complex sequence half as long, so the
+  // bit-reversal and twiddle tables and the work buffers are sized for that half length
+  const halfLength = bufferSize / 2
   this.windowValues = new Float32Array(bufferSize)
-  this.reverseTable = new Uint32Array(bufferSize)
+  this.reverseTable = new Uint32Array(halfLength)
+  this.fftCos = new Float64Array(halfLength)
+  this.fftSin = new Float64Array(halfLength)
+  this.unpackCos = new Float64Array(halfLength)
+  this.unpackSin = new Float64Array(halfLength)
+  this.real = new Float64Array(halfLength)
+  this.imag = new Float64Array(halfLength)
 
   this.peakBand = 0
   this.peak = 0
@@ -115,10 +122,11 @@ function FFT(bufferSize: number, sampleRate: number, windowFunc: string, alpha: 
     }
   }
 
+  // Bit-reversal order for the half-length complex FFT
   let limit = 1
-  let bit = bufferSize >> 1
+  let bit = halfLength >> 1
 
-  while (limit < bufferSize) {
+  while (limit < halfLength) {
     for (let i = 0; i < limit; i++) {
       this.reverseTable[i + limit] = this.reverseTable[i] + bit
     }
@@ -127,25 +135,31 @@ function FFT(bufferSize: number, sampleRate: number, windowFunc: string, alpha: 
     bit = bit >> 1
   }
 
-  // Precompute sin/cos tables for FFT twiddle factors
-  // Index 0 is a special case: -PI/0 would produce NaN, use 0 instead
-  this.sinTable[0] = 0
-  this.cosTable[0] = 1
-  for (let i = 1; i < bufferSize; i++) {
-    this.sinTable[i] = Math.sin(-Math.PI / i)
-    this.cosTable[i] = Math.cos(-Math.PI / i)
+  // fftCos/fftSin are the twiddles of the half-length FFT; unpackCos/unpackSin rotate the even
+  // and odd spectra into the bufferSize-point spectrum
+  for (let i = 0; i < halfLength; i++) {
+    this.fftCos[i] = Math.cos((-2 * Math.PI * i) / halfLength)
+    this.fftSin[i] = Math.sin((-2 * Math.PI * i) / halfLength)
+    this.unpackCos[i] = Math.cos((-2 * Math.PI * i) / bufferSize)
+    this.unpackSin[i] = Math.sin((-2 * Math.PI * i) / bufferSize)
   }
 
-  this.calculateSpectrum = function (buffer: Float32Array): Float32Array {
+  // Writes the spectrum into `out` when a buffer of the right length is supplied. Every entry is
+  // overwritten, so the buffer's earlier contents never reach the result
+  this.calculateSpectrum = function (buffer: Float32Array, out?: Float32Array): Float32Array {
     const bufferSize = this.bufferSize,
-      cosTable = this.cosTable,
-      sinTable = this.sinTable,
+      halfLength = bufferSize / 2,
       reverseTable = this.reverseTable,
-      real = new Float32Array(bufferSize),
-      imag = new Float32Array(bufferSize),
+      windowValues = this.windowValues,
+      fftCos = this.fftCos,
+      fftSin = this.fftSin,
+      unpackCos = this.unpackCos,
+      unpackSin = this.unpackSin,
+      real = this.real,
+      imag = this.imag,
       bSi = 2 / this.bufferSize,
       sqrt = Math.sqrt,
-      spectrum = new Float32Array(bufferSize / 2)
+      spectrum = out && out.length === halfLength ? out : new Float32Array(halfLength)
 
     let rval, ival, mag
 
@@ -163,55 +177,45 @@ function FFT(bufferSize: number, sampleRate: number, windowFunc: string, alpha: 
       )
     }
 
-    let halfSize = 1,
-      phaseShiftStepReal,
-      phaseShiftStepImag,
-      currentPhaseShiftReal,
-      currentPhaseShiftImag,
-      off,
-      tr,
-      ti,
-      tmpReal
-
-    for (let i = 0; i < bufferSize; i++) {
-      real[i] = buffer[reverseTable[i]] * this.windowValues[reverseTable[i]]
-      imag[i] = 0
+    // Pack the windowed samples as z[m] = x[2m] + i x[2m + 1], stored in bit-reversed order
+    for (let i = 0; i < halfLength; i++) {
+      const src = 2 * reverseTable[i]
+      real[i] = buffer[src] * windowValues[src]
+      imag[i] = buffer[src + 1] * windowValues[src + 1]
     }
 
-    while (halfSize < bufferSize) {
-      phaseShiftStepReal = cosTable[halfSize]
-      phaseShiftStepImag = sinTable[halfSize]
+    // In-place radix-2 FFT of z; within a stage each butterfly touches a disjoint pair
+    for (let size = 2; size <= halfLength; size <<= 1) {
+      const half = size >> 1
+      const step = halfLength / size
+      for (let start = 0; start < halfLength; start += size) {
+        for (let j = 0, t = 0; j < half; j++, t += step) {
+          const a = start + j
+          const b = a + half
+          const tr = fftCos[t] * real[b] - fftSin[t] * imag[b]
+          const ti = fftCos[t] * imag[b] + fftSin[t] * real[b]
 
-      currentPhaseShiftReal = 1
-      currentPhaseShiftImag = 0
-
-      for (let fftStep = 0; fftStep < halfSize; fftStep++) {
-        let i = fftStep
-
-        while (i < bufferSize) {
-          off = i + halfSize
-          tr = currentPhaseShiftReal * real[off] - currentPhaseShiftImag * imag[off]
-          ti = currentPhaseShiftReal * imag[off] + currentPhaseShiftImag * real[off]
-
-          real[off] = real[i] - tr
-          imag[off] = imag[i] - ti
-          real[i] += tr
-          imag[i] += ti
-
-          i += halfSize << 1
+          real[b] = real[a] - tr
+          imag[b] = imag[a] - ti
+          real[a] += tr
+          imag[a] += ti
         }
-
-        tmpReal = currentPhaseShiftReal
-        currentPhaseShiftReal = tmpReal * phaseShiftStepReal - currentPhaseShiftImag * phaseShiftStepImag
-        currentPhaseShiftImag = tmpReal * phaseShiftStepImag + currentPhaseShiftImag * phaseShiftStepReal
       }
-
-      halfSize = halfSize << 1
     }
 
-    for (let i = 0, N = bufferSize / 2; i < N; i++) {
-      rval = real[i]
-      ival = imag[i]
+    // Split z into the spectra E of the even samples and O of the odd samples, then combine
+    // them into X[i] = E[i] + exp(-2 pi j i / bufferSize) O[i]. Both come from conj(z[j]) with
+    // j = (halfLength - i) mod halfLength
+    for (let i = 0; i < halfLength; i++) {
+      const j = (halfLength - i) % halfLength
+      const evenR = (real[i] + real[j]) / 2
+      const evenI = (imag[i] - imag[j]) / 2
+      const oddR = (imag[i] + imag[j]) / 2
+      const oddI = (real[j] - real[i]) / 2
+      const wr = unpackCos[i]
+      const wi = unpackSin[i]
+      rval = evenR + wr * oddR - wi * oddI
+      ival = evenI + wr * oddI + wi * oddR
       mag = bSi * sqrt(rval * rval + ival * ival)
 
       if (mag > this.peak) {
@@ -229,7 +233,7 @@ export declare class FFT {
   constructor(bufferSize: number, sampleRate: number, windowFunc: string, alpha: number, windowLength?: number)
   bufferSize: number
   windowLength: number
-  calculateSpectrum(buffer: Float32Array): Float32Array
+  calculateSpectrum(buffer: Float32Array, out?: Float32Array): Float32Array
 }
 
 // Export the FFT constructor function

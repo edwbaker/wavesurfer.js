@@ -36,12 +36,12 @@ import {
 /**
  * Bounded, keyed cache of FFT instances, reused across `computeFrequencies` calls.
  *
- * Why this is safe: `FFT.calculateSpectrum` allocates fresh `real`/`imag`/`spectrum`
- * buffers on every call and never reads a previous call's output back in - the only
- * fields it mutates on `this` (`peak`/`peakBand`) are write-only running-max bookkeeping
- * that nothing in this module (or the wider codebase) reads. So two calls through the
- * same FFT instance with the same params are deterministic and independent; only the
- * expensive one-time setup (window/sin/cos/bit-reversal tables) is being reused.
+ * Why this is safe: `FFT.calculateSpectrum` overwrites its work buffers and its output in
+ * full on every call and never reads a previous call's values back in - the only fields it
+ * mutates on `this` (`peak`/`peakBand`) are write-only running-max bookkeeping that nothing
+ * in this module (or the wider codebase) reads. So two calls through the same FFT instance
+ * with the same params are deterministic and independent; only the expensive one-time setup
+ * (window, twiddle and bit-reversal tables) is being reused.
  *
  * Why it's keyed: every argument that affects the precomputed tables (bufferSize,
  * sampleRate, windowFunc, alpha, windowLength) is part of the key, so two calls that
@@ -204,6 +204,12 @@ export function computeFrequencies(channels: Float32Array[], params: FrequencyPa
   // One reused frame buffer; the zero tail beyond fftSamples doubles as the FFT padding
   const frame = new Float32Array(fftLength)
 
+  // Per-frame scratch for the spectrum and its filter-bank output. Each frame's spectrum is
+  // consumed (quantized or converted to dB) before the next frame is computed, so one pair of
+  // buffers serves the whole call and nothing is retained between frames.
+  const spectrumScratch = new Float32Array(fftLength / 2)
+  const filteredScratch = filterBank ? new Float32Array(filterBank.length) : undefined
+
   // Optional Praat display pre-emphasis, precomputed per output row
   const tilt = preEmphasis
     ? createPreEmphasisTilt(preEmphasis, getBinFrequencies(filterBank, fftLength, sampleRate))
@@ -211,11 +217,11 @@ export function computeFrequencies(channels: Float32Array[], params: FrequencyPa
 
   const computeSpectrum = (channelData: Float32Array, sample: number): Float32Array => {
     frame.set(channelData.subarray(sample, sample + fftSamples))
-    let spectrum = fft.calculateSpectrum(frame)
+    let spectrum = fft.calculateSpectrum(frame, spectrumScratch)
 
     // Apply filter bank if specified
     if (filterBank) {
-      spectrum = applySparseFilterBank(spectrum, filterBank)
+      spectrum = applySparseFilterBank(spectrum, filterBank, filteredScratch)
     }
     return spectrum
   }
