@@ -1,6 +1,8 @@
-/** Decode an array buffer into an audio buffer */
-async function decode(audioData: ArrayBuffer, sampleRate: number): Promise<AudioBuffer> {
-  const audioCtx = new AudioContext({ sampleRate })
+/**
+ * Decode an array buffer into an audio buffer. Without a sample rate the buffer is decoded at the device's rate.
+ */
+async function decode(audioData: ArrayBuffer, sampleRate?: number): Promise<AudioBuffer> {
+  const audioCtx = new AudioContext(sampleRate ? { sampleRate } : undefined)
   try {
     return await audioCtx.decodeAudioData(audioData)
   } finally {
@@ -96,8 +98,34 @@ function createBuffer(channelData: Array<Float32Array | number[]>, duration: num
   } as AudioBuffer
 }
 
+/** Whether a decoded buffer can be resampled with `resample`. Browsers without an OfflineAudioContext can't. */
+function canResample(): boolean {
+  return typeof OfflineAudioContext === 'function'
+}
+
+/**
+ * Resample a decoded buffer to another sample rate. The rendering is a resampling of the samples already decoded,
+ * not a second decode of the file, which is the expensive part of loading.
+ *
+ * The browser's buffer source does the resampling. Chromium interpolates linearly between neighbouring samples, with
+ * no low-pass filter, so content above the new rate's Nyquist frequency aliases into the result, where decodeAudioData
+ * would have filtered it. The result also depends on the rate the buffer was decoded at, which is the device's.
+ */
+async function resample(buffer: AudioBuffer, sampleRate: number): Promise<AudioBuffer> {
+  // Truncated as decodeAudioData truncates it, not rounded up: the same length a decode at this rate gives
+  const length = Math.max(1, Math.floor(buffer.length / (buffer.sampleRate / sampleRate)))
+  const offlineCtx = new OfflineAudioContext({ numberOfChannels: buffer.numberOfChannels, length, sampleRate })
+  const source = offlineCtx.createBufferSource()
+  source.buffer = buffer
+  source.connect(offlineCtx.destination)
+  source.start()
+  return offlineCtx.startRendering()
+}
+
 const Decoder = {
   decode,
+  canResample,
+  resample,
   createBuffer,
 }
 

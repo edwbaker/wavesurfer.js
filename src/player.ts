@@ -1,6 +1,6 @@
 import { signal, type WritableSignal } from './reactive/store.js'
 import { Scope } from './scope.js'
-import type WebAudioPlayer from './webaudio.js'
+import WebAudioPlayer from './webaudio.js'
 
 type PlayerOptions = {
   media?: HTMLMediaElement | WebAudioPlayer
@@ -258,6 +258,29 @@ class Player {
         this.media.src = url
       }
     }
+  }
+
+  /**
+   * Play a blob that is already decoded, under the WebAudio backend. The source is the same blob URL that setSrc gives
+   * it, so the media's src and events are unchanged, but the blob is not fetched or decoded again.
+   * @internal
+   */
+  public setDecodedSrc(blob: Blob, buffer: AudioBuffer) {
+    if (!(this.media instanceof WebAudioPlayer)) {
+      throw new Error('setDecodedSrc needs the WebAudio backend')
+    }
+
+    const prevSrc = this.getSrc()
+    this.revokeSrc()
+    this.pendingTime = null
+
+    const url = URL.createObjectURL(blob)
+    this._ownBlobUrl = url
+
+    if (prevSrc) {
+      this.media.removeAttribute('src')
+    }
+    this.media.loadBuffer(buffer, url)
   }
 
   public destroy() {
