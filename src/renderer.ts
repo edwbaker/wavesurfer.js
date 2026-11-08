@@ -342,7 +342,6 @@ class Renderer {
           z-index: 2;
         }
         :host .canvases {
-          min-height: ${this.getHeight(this.options.height, this.options.splitChannels)}px;
           pointer-events: none;
         }
         :host .canvases > div {
@@ -386,6 +385,10 @@ class Renderer {
         </div>
       </div>
     `
+
+    // Set min-height through CSSOM so the style text stays constant and a CSP hash can allow it.
+    const canvasWrapper = shadow.querySelector('.canvases') as HTMLElement
+    canvasWrapper.style.minHeight = `${this.getHeight(this.options.height, this.options.splitChannels)}px`
 
     return [div, shadow]
   }
@@ -685,13 +688,7 @@ class Renderer {
     canvasContainer.appendChild(canvas)
 
     const ctx = canvas.getContext('2d') as CanvasRenderingContext2D
-
-    if (options.renderFunction) {
-      ctx.fillStyle = this.convertColorValues(options.waveColor, ctx)
-      options.renderFunction(data, ctx)
-    } else {
-      this.renderWaveform(data, options, ctx)
-    }
+    this.renderWaveform(data, options, ctx)
 
     // Draw a progress canvas
     if (canvas.width > 0 && canvas.height > 0) {
@@ -821,8 +818,10 @@ class Renderer {
     // the peak from a slice would scale a quiet chunk to full height --
     // visible amplitude jumps at every canvas seam. The global peak also
     // spans all drawn channels (not just channel 0), so a hotter second
-    // channel can no longer overflow its half of the canvas.
-    if (options.normalize && options.maxPeak == null) {
+    // channel can no longer overflow its half of the canvas. A maxPeak of 0
+    // counts as unset, as it does in calculateVerticalScale, which would
+    // otherwise measure each slice itself.
+    if (options.normalize && !options.maxPeak) {
       options = { ...options, maxPeak: utils.calculateGlobalPeak(channelData) }
     }
 
@@ -939,7 +938,7 @@ class Renderer {
     this.reRender()
   }
 
-  private scrollIntoView(progress: number, isPlaying = false, previousProgress?: number) {
+  private scrollIntoView(progress: number, duration: number, isPlaying = false, previousProgress?: number) {
     const { scrollLeft, scrollWidth, clientWidth } = this.scrollContainer
     const progressWidth = progress * scrollWidth
     const startEdge = scrollLeft
@@ -964,12 +963,6 @@ class Renderer {
       // Keep the cursor centered when playing
       const center = progressWidth - viewStart - middle
       if (isPlaying && this.options.autoCenter && center > 0) {
-        const duration = this.audioData?.duration
-        if (duration === undefined || duration <= 0) {
-          this.scrollContainer.scrollLeft += center
-          return
-        }
-
         const pixelsPerSecond = scrollWidth / duration
         if (pixelsPerSecond <= LOW_ZOOM_PIXELS_PER_SECOND_THRESHOLD) {
           // At most the smoothing step, or where the cursor has moved further
@@ -1000,7 +993,7 @@ class Renderer {
 
     // Only scroll if we have valid audio data to prevent race conditions during loading
     if (this.isScrollable.value && this.options.autoScroll && this.audioData && this.audioData.duration > 0) {
-      this.scrollIntoView(progress, isPlaying, previousProgress)
+      this.scrollIntoView(progress, this.audioData.duration, isPlaying, previousProgress)
     }
   }
 

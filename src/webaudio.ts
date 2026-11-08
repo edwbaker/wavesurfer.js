@@ -10,6 +10,7 @@ type WebAudioPlayerEvents = {
   seeked: []
   timeupdate: []
   volumechange: []
+  ratechange: []
   emptied: []
   ended: []
   error: [error: Error]
@@ -351,6 +352,7 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     return this._playbackRate
   }
   set playbackRate(value) {
+    const changed = value !== this._playbackRate
     const wasPlaying = !this.paused
     if (wasPlaying) this._pause()
     this._playbackRate = value
@@ -359,6 +361,10 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     if (this.bufferNode) {
       this.bufferNode.playbackRate.value = value
     }
+
+    // Like an HTMLMediaElement, report a change of rate: Player's
+    // playback-rate state is only updated from this event
+    if (changed) this.emit('ratechange')
   }
 
   get currentTime() {
@@ -408,6 +414,10 @@ class WebAudioPlayer extends EventEmitter<WebAudioPlayerEvents> {
     } else {
       this.gainNode.connect(this.audioContext.destination)
     }
+
+    // An HTMLMediaElement reports a mute change as 'volumechange', the event
+    // Player reads its muted state from
+    this.emit('volumechange')
   }
 
   public canPlayType(mimeType: string) {
