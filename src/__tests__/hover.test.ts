@@ -2,12 +2,13 @@ import HoverPlugin from '../plugins/hover.js'
 import { signal } from '../reactive/store.js'
 import { createEmitter } from './helpers/create-emitter.js'
 
-const createWaveSurfer = (container: HTMLElement, durationValue: number) => {
+// Pass a `bbox` and change its `left` to scroll the waveform under the pointer
+const createWaveSurfer = (container: HTMLElement, durationValue: number, bbox = { left: 0, width: 100 }) => {
   const duration = signal(durationValue)
 
   Object.defineProperty(container, 'getBoundingClientRect', {
     configurable: true,
-    value: () => ({ left: 0, width: 100 }),
+    value: () => ({ ...bbox }),
   })
 
   document.body.appendChild(container)
@@ -28,6 +29,75 @@ describe('HoverPlugin', () => {
   afterEach(() => {
     document.body.innerHTML = ''
     jest.clearAllMocks()
+    jest.restoreAllMocks()
+  })
+
+  test('flips the label at the same positions as before, on pointer move and on scroll', () => {
+    jest.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(30)
+    // The flip rule the plugin has always applied, here for a 30px label and
+    // the default 1px line in a 100px wide waveform
+    const expectedTransform = (posX: number, labelPreferLeft: boolean) =>
+      (labelPreferLeft ? posX - 30 > 0 : posX + 30 > 100) ? 'translateX(-31px)' : ''
+
+    for (const labelPreferLeft of [false, true]) {
+      const container = document.createElement('div')
+      const bbox = { left: 0, width: 100 }
+      const { wavesurfer } = createWaveSurfer(container, 10, bbox)
+      const plugin = HoverPlugin.create({ labelPreferLeft })
+      plugin._init(wavesurfer as any)
+      const label = container.querySelector<HTMLElement>('[part="hover-label"]')!
+
+      // posX is capped at width - lineWidth - 1 = 98
+      for (let clientX = 0; clientX <= 100; clientX++) {
+        container.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX }))
+        expect(label.style.transform).toBe(expectedTransform(Math.min(98, clientX), labelPreferLeft))
+      }
+
+      // Rest the pointer, then scroll the waveform under it
+      container.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 20 }))
+      for (let scrolled = 0; scrolled <= 100; scrolled++) {
+        bbox.left = -scrolled
+        wavesurfer.emit('scroll')
+        expect(label.style.transform).toBe(expectedTransform(Math.min(98, 20 + scrolled), labelPreferLeft))
+      }
+
+      plugin.destroy()
+    }
+  })
+
+  test('measures the label on pointer move and when its text changes length, not on every scroll', () => {
+    const offsetWidth = jest.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(30)
+    const container = document.createElement('div')
+    const bbox = { left: 0, width: 100 }
+    const { wavesurfer } = createWaveSurfer(container, 20, bbox)
+
+    const plugin = HoverPlugin.create({ formatTimeCallback: (seconds: number) => seconds.toFixed(2) })
+    plugin._init(wavesurfer as any)
+    const label = container.querySelector<HTMLElement>('[part="hover-label"]')!
+
+    container.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 25 }))
+    expect(label.textContent).toBe('5.00')
+    expect(offsetWidth).toHaveBeenCalledTimes(1)
+
+    // The text follows the scroll but keeps its length, so the width is reused
+    bbox.left = -10
+    wavesurfer.emit('scroll')
+    expect(label.textContent).toBe('7.00')
+    bbox.left = -20
+    wavesurfer.emit('zoom')
+    expect(label.textContent).toBe('9.00')
+    expect(offsetWidth).toHaveBeenCalledTimes(1)
+
+    // A longer text is measured again
+    bbox.left = -30
+    wavesurfer.emit('scroll')
+    expect(label.textContent).toBe('11.00')
+    expect(offsetWidth).toHaveBeenCalledTimes(2)
+
+    // And so is every pointer move
+    container.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 26 }))
+    expect(label.textContent).toBe('11.20')
+    expect(offsetWidth).toHaveBeenCalledTimes(3)
   })
 
   test('passes the current wavesurfer duration to formatTimeCallback', () => {

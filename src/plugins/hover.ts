@@ -104,6 +104,32 @@ const HoverPlugin = definePlugin<HoverPluginOptions, HoverPluginEvents, object>(
   let lastPointerPosition: { clientX: number; clientY: number } | null = null
   let isPointerOverWaveform = false
   let transitionEndCleanup: (() => void) | null = null
+  let labelWidth = 0
+
+  // Moves the line and the label to a pointer position. The label's width is
+  // measured on pointer move (`measure`) and when its text changes length, and
+  // reused otherwise: scrolls come every frame during auto-centred playback,
+  // and reading offsetWidth there would force a layout each time.
+  function update(clientX: number, measure: boolean): number {
+    // Position
+    const bbox = ctx.wavesurfer.getWrapper().getBoundingClientRect()
+    const { width } = bbox
+    const offsetX = clientX - bbox.left
+    const relX = Math.min(1, Math.max(0, offsetX / width))
+    const posX = Math.min(width - lineWidthPx - 1, offsetX)
+    wrapper.style.transform = `translateX(${posX}px)`
+
+    // Timestamp
+    const dur = ctx.wavesurfer.getDuration()
+    const text = opts.formatTimeCallback(dur * relX)
+    const lastText = label.textContent ?? ''
+    if (text !== lastText) label.textContent = text
+    if (measure || text.length !== lastText.length) labelWidth = label.offsetWidth
+    const transformCondition = opts.labelPreferLeft ? posX - labelWidth > 0 : posX + labelWidth > width
+    label.style.transform = transformCondition ? `translateX(-${labelWidth + lineWidthPx}px)` : ''
+
+    return relX
+  }
 
   // Create event streams for pointer events
   const pointerMove = fromEvent(container, 'pointermove')
@@ -129,21 +155,8 @@ const HoverPlugin = definePlugin<HoverPluginOptions, HoverPluginEvents, object>(
       // Store only the position data needed for zoom/scroll updates
       lastPointerPosition = { clientX: e.clientX, clientY: e.clientY }
 
-      // Position
-      const bbox = ctx.wavesurfer.getWrapper().getBoundingClientRect()
-      const { width } = bbox
-      const offsetX = e.clientX - bbox.left
-      const relX = Math.min(1, Math.max(0, offsetX / width))
-      const posX = Math.min(width - lineWidthPx - 1, offsetX)
-      wrapper.style.transform = `translateX(${posX}px)`
+      const relX = update(e.clientX, true)
       wrapper.style.opacity = '1'
-
-      // Timestamp
-      const dur = ctx.wavesurfer.getDuration()
-      label.textContent = opts.formatTimeCallback(dur * relX)
-      const labelWidth = label.offsetWidth
-      const transformCondition = opts.labelPreferLeft ? posX - labelWidth > 0 : posX + labelWidth > width
-      label.style.transform = transformCondition ? `translateX(-${labelWidth + lineWidthPx}px)` : ''
 
       // Emit a hover event with the relative X position
       ctx.emit('hover', relX)
@@ -190,20 +203,7 @@ const HoverPlugin = definePlugin<HoverPluginOptions, HoverPluginEvents, object>(
   // When zoom or scroll happens, re-run the pointer move logic with the last known mouse position
   const onUpdate = () => {
     if (lastPointerPosition) {
-      // Position
-      const bbox = ctx.wavesurfer.getWrapper().getBoundingClientRect()
-      const { width } = bbox
-      const offsetX = lastPointerPosition.clientX - bbox.left
-      const relX = Math.min(1, Math.max(0, offsetX / width))
-      const posX = Math.min(width - lineWidthPx - 1, offsetX)
-      wrapper.style.transform = `translateX(${posX}px)`
-
-      // Timestamp
-      const dur = ctx.wavesurfer.getDuration()
-      label.textContent = opts.formatTimeCallback(dur * relX)
-      const labelWidth = label.offsetWidth
-      const transformCondition = opts.labelPreferLeft ? posX - labelWidth > 0 : posX + labelWidth > width
-      label.style.transform = transformCondition ? `translateX(-${labelWidth + lineWidthPx}px)` : ''
+      update(lastPointerPosition.clientX, false)
     }
   }
 
